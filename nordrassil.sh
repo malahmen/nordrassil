@@ -138,7 +138,6 @@ ETC_DIR="${CONFIG_DIR}/etc"
 PF_DIR="${CONFIG_DIR}/pf"
 MIGRATIONS_MARKER_DIR="${CONFIG_DIR}/applied-migrations"
 IMAGE_BUILD_CONTEXT="${CONFIG_DIR}/image-build-context"
-ACE_DEPS_DIR="${CONFIG_DIR}/deps/ACE_wrappers"
 
 mkdir -p "$CONFIG_DIR" "$ETC_DIR" "$PF_DIR" "$MIGRATIONS_MARKER_DIR"
 
@@ -148,6 +147,15 @@ CLIENT_BUILD_DEFAULT=5875
 # FindACE.cmake has no version floor/ceiling of its own, so an untested newer
 # ACE could silently drop an API this codebase still uses.
 ACE_BUILD_VERSION="8.0.7"
+# Shared across projects/repos on this machine, NOT under CONFIG_DIR — ACE
+# itself has nothing project-specific about it, so every fork/port of this
+# script (this one included — ported from vanilla-wow-server) reuses the same
+# from-source build instead of paying the multi-minute compile again just
+# because CONFIG_DIR's name changed. Versioned in the path since
+# _build_ace_from_source only checks for the built files' existence, not
+# their version — a bump to ACE_BUILD_VERSION must land in a new directory,
+# not silently reuse a stale build under the old one.
+ACE_DEPS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ace-wrappers/${ACE_BUILD_VERSION}/ACE_wrappers"
 
 # -----------------------------------------------------------------------------
 # Config persistence (flat key=value file, lgtm.sh style — enough knobs here
@@ -194,7 +202,13 @@ _settings() {
     DB_PORT="$(cfg_default DB_PORT 3306)"
     DB_USER="$(cfg_default DB_USER root)"
     DB_PASS="$(cfg_default DB_PASS root)"
-    DB_CONTAINER_NAME="$(cfg_default DB_CONTAINER_NAME vanilla-wow-mariadb)"
+    # DB_VOLUME's default intentionally still says vanilla-wow-mariadb-data —
+    # this is the same underlying server, just ported to its own repo/name;
+    # the container was adopted via `docker rename`, not recreated, so the
+    # actual volume backing it really is still called that. Renaming a
+    # Docker volume isn't a thing (would need create+copy), so the default
+    # here just needs to keep matching reality, not the project's new name.
+    DB_CONTAINER_NAME="$(cfg_default DB_CONTAINER_NAME nordrassil-mariadb)"
     DB_VOLUME="$(cfg_default DB_VOLUME vanilla-wow-mariadb-data)"
     REALM_ID="$(cfg_default REALM_ID 1)"
     REALM_PORT="$(cfg_default REALM_PORT 3724)"
