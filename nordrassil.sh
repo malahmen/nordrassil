@@ -211,7 +211,12 @@ _detect_lan_ip() {
 }
 
 _settings() {
+    # Paths the front-end may hand over with a literal leading '~' (a quoted
+    # 'set SOURCE_DIR ~/x' never reaches the shell's own tilde expansion) —
+    # expand it the same way CONFIG_DIR is, so it isn't mkdir'd/mounted as a
+    # directory literally named '~'.
     SOURCE_DIR="$(cfg_default SOURCE_DIR "${HOME}/jaws/MaNGOS")"
+    SOURCE_DIR="${SOURCE_DIR/#\~/$HOME}"
     CLIENT_BUILD="$(cfg_default CLIENT_BUILD "$CLIENT_BUILD_DEFAULT")"
     DB_HOST="$(cfg_default DB_HOST 127.0.0.1)"
     DB_PORT="$(cfg_default DB_PORT 3306)"
@@ -268,7 +273,9 @@ _settings() {
     # k8s storage (set by the front-end): hostpath | storageclass, + paths/class.
     K8S_STORAGE_TYPE="$(cfg_default K8S_STORAGE_TYPE hostpath)"
     K8S_DATA_HOSTPATH="$(cfg_default K8S_DATA_HOSTPATH "${SOURCE_DIR}/data")"
+    K8S_DATA_HOSTPATH="${K8S_DATA_HOSTPATH/#\~/$HOME}"
     K8S_DB_HOSTPATH="$(cfg_default K8S_DB_HOSTPATH /var/vanilla-wow-mariadb)"
+    K8S_DB_HOSTPATH="${K8S_DB_HOSTPATH/#\~/$HOME}"
     K8S_STORAGECLASS="$(cfg_default K8S_STORAGECLASS "")"
 }
 
