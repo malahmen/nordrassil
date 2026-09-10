@@ -34,6 +34,12 @@
 # front-end pushes values with 'set <KEY> <VALUE>'; commands read them back.
 # -----------------------------------------------------------------------------
 
+# bash 4+: ${var^^} (delete-account), read -a/arrays etc. macOS ships 3.2.
+if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]]; then
+    echo "[error] bash 4+ required (you have ${BASH_VERSION}). On macOS: brew install bash" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -986,8 +992,10 @@ _detect_running_target() {
     # themselves for the k8s case.
     if [[ "$chosen" == "k8s" ]]; then
         local pod
+        # '|| pod=""': a failing kubectl must fall through to the warn below,
+        # not kill the script silently under set -e (stderr is muted).
         # shellcheck disable=SC2086
-        pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || pod=""
         if [[ -z "$pod" ]]; then
             warn "No running vanilla-wow-server pod found in namespace ${K8S_NAMESPACE}."
             return 1
@@ -1212,8 +1220,12 @@ cmd_delete_account() {
     # Needed for the account_access cleanup below: that row can only be
     # looked up by account id, and 'account delete' removes the account row
     # itself, so the id has to be captured before the console command runs.
+    # stderr muted (the mariadb client's password-on-command-line notice), so
+    # a failed query must be reported here — under set -e a bare failing
+    # assignment would otherwise end the script with no message at all.
     local acc_id user_sql; user_sql="$(_sql_escape "${user_input^^}")"
-    acc_id=$(_db_query_raw "$target" "SELECT id FROM realmd.account WHERE username='${user_sql}';" 2>/dev/null)
+    acc_id=$(_db_query_raw "$target" "SELECT id FROM realmd.account WHERE username='${user_sql}';" 2>/dev/null) \
+        || { warn "Account id lookup failed (is MariaDB reachable with DB_USER/DB_PASS?) — the account_access cleanup below will be skipped."; acc_id=""; }
 
     _send_console_cmd "$target" "account delete ${user_input}" || return 1
 
@@ -1295,7 +1307,10 @@ cmd_rename_character() {
 
     local old_name_escaped; old_name_escaped="$(_sql_escape "$old_name")"
     local row guid online
-    row=$(_db_query_raw "$target" "SELECT guid, online FROM characters.characters WHERE name='${old_name_escaped}';" 2>/dev/null)
+    # See delete-account: stderr is muted, so a failed query is reported here
+    # rather than silently ending the script under set -e.
+    row=$(_db_query_raw "$target" "SELECT guid, online FROM characters.characters WHERE name='${old_name_escaped}';" 2>/dev/null) \
+        || { warn "Character lookup failed (is MariaDB reachable with DB_USER/DB_PASS?)."; return 1; }
     if [[ -z "$row" ]]; then
         warn "No character named '${old_name}' found."
         return 1
@@ -1315,7 +1330,8 @@ cmd_rename_character() {
 
     local new_name_escaped; new_name_escaped="$(_sql_escape "$new_name")"
     local existing
-    existing=$(_db_query_raw "$target" "SELECT guid FROM characters.characters WHERE name='${new_name_escaped}';" 2>/dev/null)
+    existing=$(_db_query_raw "$target" "SELECT guid FROM characters.characters WHERE name='${new_name_escaped}';" 2>/dev/null) \
+        || { warn "Name availability check failed (is MariaDB reachable with DB_USER/DB_PASS?)."; return 1; }
     if [[ -n "$existing" && "$existing" != "$guid" ]]; then
         warn "'${new_name}' is already taken by another character."
         return 1
