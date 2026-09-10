@@ -83,9 +83,15 @@ spec:
               # deployment-specific (the realm's actual reachable
               # address/port). Without it mangosd refuses to start.
               echo "Ensuring realmlist row..."
+              # REALM_NAME/REALM_ADDRESS are operator free text — escape them
+              # for the single-quoted SQL literals (same as nordrassil.sh's
+              # _sql_escape: backslash first, then the quote).
+              sql_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
+              realm_name_sql="$(sql_escape "${REALM_NAME}")"
+              realm_addr_sql="$(sql_escape "${REALM_ADDRESS}")"
               mysql realmd -e "INSERT INTO realmlist (id, name, address, localAddress, localSubnetMask, port, gamebuild_min, gamebuild_max)
-                VALUES (${REALM_ID}, '${REALM_NAME}', '${REALM_ADDRESS}', '127.0.0.1', '255.255.255.0', ${WORLD_PORT}, ${CLIENT_BUILD}, ${CLIENT_BUILD})
-                ON DUPLICATE KEY UPDATE name='${REALM_NAME}', address='${REALM_ADDRESS}', port=${WORLD_PORT}, gamebuild_min=${CLIENT_BUILD}, gamebuild_max=${CLIENT_BUILD};"
+                VALUES (${REALM_ID}, '${realm_name_sql}', '${realm_addr_sql}', '127.0.0.1', '255.255.255.0', ${WORLD_PORT}, ${CLIENT_BUILD}, ${CLIENT_BUILD})
+                ON DUPLICATE KEY UPDATE name='${realm_name_sql}', address='${realm_addr_sql}', port=${WORLD_PORT}, gamebuild_min=${CLIENT_BUILD}, gamebuild_max=${CLIENT_BUILD};"
               echo "DB bootstrap complete."
       volumes:
         - name: sql

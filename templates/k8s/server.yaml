@@ -24,6 +24,11 @@ spec:
       containers:
         - name: vanilla-wow-server
           image: __IMAGE_TAG__
+          # IfNotPresent: the image is built locally (build-image) and, on
+          # kind, side-loaded with 'kind load' — it isn't in any registry.
+          # The default for a :latest tag is Always, which makes kubelet try
+          # to pull from Docker Hub and fail (ImagePullBackOff).
+          imagePullPolicy: IfNotPresent
           # stdin: true — mangosd/realmd run an interactive console reader
           # on stdin; without an open stdin the container gets an immediate
           # EOF, which the console reads as an implicit quit (the server
