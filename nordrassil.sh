@@ -19,8 +19,9 @@
 #   - Local native (install-deps/configure/start/stop): builds mangosd/realmd
 #     directly on this host via cmake+make for fast iteration. ACE toolkit
 #     (a hard build dependency) isn't packaged for Fedora/RHEL, so install-deps
-#     builds it from source there instead (cached under CONFIG_DIR/deps) —
-#     see _build_ace_from_source. Still works everywhere apt has libace-dev.
+#     builds it from source there instead (cached under ACE_DEPS_DIR,
+#     ~/.cache/ace-wrappers/<version>) — see _build_ace_from_source. Still
+#     works everywhere apt has libace-dev.
 #   - Container (build-image/run-docker/run-k8s): always builds inside an
 #     Ubuntu build stage regardless of host OS, so it works everywhere Docker
 #     does. This is the actual LAN-deployable artifact.
@@ -264,7 +265,7 @@ _settings() {
 # _resolve_ace_root — echoes a usable ACE_ROOT and returns 0, checking (in
 # priority order): an already-exported ACE_ROOT, the Debian/Ubuntu package
 # location, then the from-source build this script maintains under
-# CONFIG_DIR (see _build_ace_from_source). Echoes nothing and returns 1 if
+# ACE_DEPS_DIR (see _build_ace_from_source). Echoes nothing and returns 1 if
 # none are usable. No install/messaging side effects, so both install-deps
 # (_ensure_ace) and the build itself (_build_native) can check without
 # duplicating the lookup.
@@ -279,8 +280,8 @@ _ace_present() { _resolve_ace_root &>/dev/null; }
 
 # _build_ace_from_source — builds ACE via its own classic Linux GNU
 # makefiles (the same mechanism the official ACE-INSTALL docs describe),
-# in place under CONFIG_DIR — no 'make install', nothing touches the system
-# outside this directory. FindACE.cmake only needs ACE_ROOT pointed at it
+# in place under ACE_DEPS_DIR — no 'make install', nothing touches the
+# system outside this directory. FindACE.cmake only needs ACE_ROOT pointed at it
 # (it checks "$ACE_ROOT/ace/ACE.h" for the header and "$ACE_ROOT/lib" for
 # the library), which _resolve_ace_root wires up automatically once this
 # has run once. Verified against this project's actual FindACE.cmake and a
@@ -1303,10 +1304,12 @@ cmd_search() {
 }
 
 # -----------------------------------------------------------------------------
-# edit — escape hatch for anything 'configure' doesn't prompt for. Opens the
-# already-configured conf files (not the repack's pristine copies) in vim,
-# which setup.sh already installs. Picked up automatically by run-docker/
+# edit — escape hatch for anything 'configure' doesn't take from the config
+# store. Opens the already-configured conf files (not the repack's pristine
+# copies) in $EDITOR (default vim). Picked up automatically by run-docker/
 # run-k8s afterward via _effective_conf_source; 'start' just needs a restart.
+# Note that a later 'configure' re-renders these from the pristine copies and
+# discards the edits.
 # -----------------------------------------------------------------------------
 
 cmd_edit() {
@@ -1735,7 +1738,7 @@ Global flags (kube target for run-k8s/stop-k8s):
 
 Setup / local:
   install-deps
-  configure [--custom NAMES]      build/refresh image prerequisites + DB bootstrap
+  configure [--custom NAMES]      DB bootstrap + render the local conf files (no build)
   edit --file mangosd|realmd      open a conf file in $EDITOR (default vim)
   start | stop | status
 
@@ -1760,6 +1763,8 @@ Search:
 
 Config store (used by the scomp-link front-end):
   set KEY VALUE | get KEY | config | list-custom
+
+  help | -h | --help
 EOF
 }
 

@@ -24,11 +24,11 @@ spec:
       containers:
         - name: vanilla-wow-server
           image: __IMAGE_TAG__
-          # stdin: true — mangosd/realmd run an interactive console reader
-          # on stdin; without an open stdin the container gets an immediate
-          # EOF, which the console reads as an implicit quit (the server
-          # fully starts — DB connected, world initialized, ports bound —
-          # then shuts itself down cleanly seconds later).
+          # stdin: true — mangosd/realmd treat EOF on their console stdin as
+          # an implicit quit. entrypoint.sh already guards against that on
+          # its own (process substitution for realmd, a held-open FIFO for
+          # mangosd), so this isn't what keeps the server up; it only keeps
+          # the container's own stdin attachable ('kubectl attach -i').
           stdin: true
           ports:
             - containerPort: __REALM_PORT__
