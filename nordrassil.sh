@@ -1615,13 +1615,12 @@ cmd_run_k8s() {
     echo "---" >> "$manifest"
     inject_block "${k8s_tpl}/mariadb.yaml" "DB_SOURCE" "$db_source_file" \
         | render_template /dev/stdin "NAMESPACE=${K8S_NAMESPACE}" "DB_PASS=${DB_PASS}" >> "$manifest"
-    echo "---" >> "$manifest"
-    inject_block "${k8s_tpl}/server.yaml" "DATA_SOURCE" "$data_source_file" \
-        | render_template /dev/stdin \
-            "NAMESPACE=${K8S_NAMESPACE}" "IMAGE_TAG=${IMAGE_TAG}" \
-            "REALM_PORT=${REALM_PORT}" "WORLD_PORT=${WORLD_PORT}" >> "$manifest"
 
-    info "Applying manifests..."
+    # server.yaml is deliberately NOT part of this manifest — it's applied
+    # last, after the db-init Job has completed (see below). entrypoint.sh
+    # has no DB-wait of its own, so a server pod started alongside the Job
+    # crash-loops for the whole world-dump import on a first deploy.
+    info "Applying manifests (namespace, storage, mariadb)..."
     # shellcheck disable=SC2086
     kubectl $ctx_flags apply -f "$manifest" || error_exit "kubectl apply failed."
 
@@ -1646,6 +1645,12 @@ cmd_run_k8s() {
         || error_exit "Failed to create the server ConfigMap."
 
     info "Running DB bootstrap Job (schemas + world dump + migrations)..."
+    # A Job's pod template is immutable once created, so re-applying it with
+    # anything changed (realm address, password, sql path) fails — delete
+    # any previous run first (also drops its completed/failed pods).
+    # shellcheck disable=SC2086
+    kubectl $ctx_flags -n "$K8S_NAMESPACE" delete job vanilla-wow-db-init --ignore-not-found \
+        || error_exit "Failed to remove the previous db-init Job."
     render_template "${k8s_tpl}/db-init-job.yaml" \
         "NAMESPACE=${K8S_NAMESPACE}" "DB_PASS=${DB_PASS}" \
         "REALM_ID=${REALM_ID}" "REALM_NAME=$(_yaml_escape "$REALM_NAME")" "REALM_ADDRESS=$(_yaml_escape "$REALM_ADDRESS")" \
@@ -1656,8 +1661,17 @@ cmd_run_k8s() {
     # shellcheck disable=SC2086
     info "Waiting for db-init Job to complete (world dump import can take a while)..."
         kubectl $ctx_flags -n "$K8S_NAMESPACE" wait --for=condition=complete job/vanilla-wow-db-init --timeout=900s \
-        || warn "db-init Job did not complete in time. Check: kubectl -n ${K8S_NAMESPACE} logs job/vanilla-wow-db-init"
+        || warn "db-init Job did not complete in time — deploying the server anyway (it restarts until the DB is ready). Check: kubectl -n ${K8S_NAMESPACE} logs job/vanilla-wow-db-init"
     rm -f "${manifest}.job"
+
+    # Only now that the DB is bootstrapped: the server Deployment.
+    info "Applying server deployment..."
+    # shellcheck disable=SC2086
+    inject_block "${k8s_tpl}/server.yaml" "DATA_SOURCE" "$data_source_file" \
+        | render_template /dev/stdin \
+            "NAMESPACE=${K8S_NAMESPACE}" "IMAGE_TAG=${IMAGE_TAG}" \
+            "REALM_PORT=${REALM_PORT}" "WORLD_PORT=${WORLD_PORT}" \
+        | kubectl $ctx_flags apply -f - || error_exit "server deployment apply failed."
 
     # shellcheck disable=SC2086
     info "Waiting for server rollout..."
