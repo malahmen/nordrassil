@@ -31,11 +31,11 @@ spec:
             - name: sql
               mountPath: /sql
               readOnly: true
-          # Mirrors server.sh's _db_bootstrap: create schemas, import
-          # Base + the full world dump + Migrations in filename order, then
-          # any optional Custom content (Job runs non-interactively, so the
-          # gum-confirm gate from local 'configure' doesn't apply here —
-          # Custom content is always applied by this Job).
+          # Mirrors nordrassil.sh's _db_bootstrap: create schemas, import
+          # Base + Anticheat + the full world dump + Migrations in filename
+          # order, then Custom content. Unlike 'configure', which applies
+          # only the scripts named in CUSTOM_SQL, this Job applies every
+          # sql/Custom/*.sql it finds (nothing renders a selection into it).
           command:
             - bash
             - -c
