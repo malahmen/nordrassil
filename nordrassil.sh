@@ -1551,13 +1551,17 @@ cmd_run_k8s() {
     local k8s_tpl="${TEMPLATES_DIR}/k8s"
     local manifest; manifest="$(mktemp /tmp/vanilla-wow-k8s-XXXXXX.yaml)"
     local storage_type; storage_type="$K8S_STORAGE_TYPE"
-    local data_source_file db_source_file
+    local data_source_file db_source_file job_manifest
     data_source_file="$(mktemp /tmp/vanilla-wow-data-src-XXXXXX)"
     db_source_file="$(mktemp /tmp/vanilla-wow-db-src-XXXXXX)"
-    # One trap for all three temp files — a second 'trap ... RETURN' would
-    # silently replace the first rather than adding to it.
+    job_manifest="$(mktemp /tmp/vanilla-wow-db-init-XXXXXX.yaml)"
+    # One trap for all four temp files — a second trap on the same signal
+    # would silently replace the first rather than adding to it. EXIT, not
+    # RETURN: error_exit's 'exit 1' never runs a RETURN trap, which used to
+    # leave the rendered manifests (the DB password among them) in /tmp.
+    # All four are mktemp-created, i.e. 0600.
     # shellcheck disable=SC2064
-    trap "rm -f '${manifest}' '${data_source_file}' '${db_source_file}'" RETURN
+    trap "rm -f '${manifest}' '${data_source_file}' '${db_source_file}' '${job_manifest}'" EXIT
 
     # inject_block splices these lines in VERBATIM (no reindentation) in place
     # of the "__DATA_SOURCE__"/"__DB_SOURCE__" placeholder line in the
@@ -1577,6 +1581,14 @@ cmd_run_k8s() {
 
     render_template "${k8s_tpl}/namespace.yaml" "NAMESPACE=${K8S_NAMESPACE}" > "$manifest"
 
+    # DB root password as a Secret (referenced via secretKeyRef by mariadb.yaml
+    # and db-init-job.yaml below) — right after the namespace so it exists
+    # before anything that mounts it. base64 output is [A-Za-z0-9+/=] only,
+    # so it needs no YAML quoting and is safe for render_template's sed.
+    local db_pass_b64; db_pass_b64="$(printf '%s' "$DB_PASS" | base64 | tr -d '\n')"
+    echo "---" >> "$manifest"
+    render_template "${k8s_tpl}/db-secret.yaml" "NAMESPACE=${K8S_NAMESPACE}" "DB_PASS_B64=${db_pass_b64}" >> "$manifest"
+
     if [[ "$storage_type" != "hostpath" ]]; then
         local sc; sc="$K8S_STORAGECLASS"
         local sc_line=""
@@ -1591,7 +1603,7 @@ cmd_run_k8s() {
 
     echo "---" >> "$manifest"
     inject_block "${k8s_tpl}/mariadb.yaml" "DB_SOURCE" "$db_source_file" \
-        | render_template /dev/stdin "NAMESPACE=${K8S_NAMESPACE}" "DB_PASS=${DB_PASS}" >> "$manifest"
+        | render_template /dev/stdin "NAMESPACE=${K8S_NAMESPACE}" >> "$manifest"
     echo "---" >> "$manifest"
     inject_block "${k8s_tpl}/server.yaml" "DATA_SOURCE" "$data_source_file" \
         | render_template /dev/stdin \
@@ -1624,17 +1636,16 @@ cmd_run_k8s() {
 
     info "Running DB bootstrap Job (schemas + world dump + migrations)..."
     render_template "${k8s_tpl}/db-init-job.yaml" \
-        "NAMESPACE=${K8S_NAMESPACE}" "DB_PASS=${DB_PASS}" \
+        "NAMESPACE=${K8S_NAMESPACE}" \
         "REALM_ID=${REALM_ID}" "REALM_NAME=${REALM_NAME}" "REALM_ADDRESS=${REALM_ADDRESS}" \
         "WORLD_PORT=${WORLD_PORT}" "CLIENT_BUILD=${CLIENT_BUILD}" \
-        "SQL_HOSTPATH=${SOURCE_DIR}/sql" > "${manifest}.job"
+        "SQL_HOSTPATH=${SOURCE_DIR}/sql" > "$job_manifest"
     # shellcheck disable=SC2086
-    kubectl $ctx_flags apply -f "${manifest}.job" || error_exit "db-init Job apply failed."
+    kubectl $ctx_flags apply -f "$job_manifest" || error_exit "db-init Job apply failed."
     # shellcheck disable=SC2086
     info "Waiting for db-init Job to complete (world dump import can take a while)..."
         kubectl $ctx_flags -n "$K8S_NAMESPACE" wait --for=condition=complete job/vanilla-wow-db-init --timeout=900s \
         || warn "db-init Job did not complete in time. Check: kubectl -n ${K8S_NAMESPACE} logs job/vanilla-wow-db-init"
-    rm -f "${manifest}.job"
 
     # shellcheck disable=SC2086
     info "Waiting for server rollout..."
