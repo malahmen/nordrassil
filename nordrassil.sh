@@ -177,15 +177,24 @@ ACE_DEPS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ace-wrappers/${ACE_BUILD_VERSION}/
 # that partial get/set beats dozzle.sh's plain whole-file source)
 # -----------------------------------------------------------------------------
 
+# Escapes a value for use as the replacement text of a sed 's|...|...|'
+# command (backslash, '&', and the '|' delimiter every sed call in this
+# script uses). Shared by cfg_set, the conf renderers and render_template.
+_sed_escape() { printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'; }
+
 cfg_get() {
     grep -E "^${1}=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' || true
 }
 cfg_set() {
     local key="$1" val="$2" quoted
+    # The key is spliced into a regex and the value into a sed replacement;
+    # the file is one key=value per line, so neither may carry a newline.
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || error_exit "set: invalid key '${key}' (letters, digits, underscore)."
+    [[ "$val" != *$'\n'* ]] || error_exit "set: ${key}: value must not contain a newline."
     quoted="\"${val}\""
     touch "$CONFIG_FILE"
     if grep -qE "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-        sed -i.bak "s|^${key}=.*|${key}=${quoted}|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+        sed -i.bak "s|^${key}=.*|${key}=$(_sed_escape "$quoted")|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
     else
         echo "${key}=${quoted}" >> "$CONFIG_FILE"
     fi
@@ -581,6 +590,11 @@ _ensure_realmlist() {
 _render_mangosd_conf() {
     local src="$1" dst="$2" data_dir="$3" logs_dir="$4" warden_dir="$5"
     local motd_escaped; motd_escaped="$(_sed_escape "$MOTD")"
+    # Everything spliced into a sed replacement below goes through
+    # _sed_escape — a DB password or path containing '&', '|' or '\' would
+    # otherwise corrupt the line (or, with '|', break the sed command).
+    data_dir="$(_sed_escape "$data_dir")"; logs_dir="$(_sed_escape "$logs_dir")"; warden_dir="$(_sed_escape "$warden_dir")"
+    local db_conn; db_conn="$(_sed_escape "${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS}")"
     cp "$src" "$dst"
     # The repack's conf files ship with Windows CRLF line endings (they were
     # distributed alongside .exe binaries). Left as-is, sed's substitutions
@@ -596,10 +610,10 @@ _render_mangosd_conf() {
         -e "s|^Warden\.WinEnabled[[:space:]]*=.*|Warden.WinEnabled            = ${WARDEN_ENABLED}|" \
         -e "s|^Warden\.OSXEnabled[[:space:]]*=.*|Warden.OSXEnabled            = ${WARDEN_ENABLED}|" \
         -e "s|^StrictPlayerNames[[:space:]]*=.*|StrictPlayerNames = ${STRICT_PLAYER_NAMES}|" \
-        -e "s|^LoginDatabase\.Info[[:space:]]*=.*|LoginDatabase.Info              = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};realmd\"|" \
-        -e "s|^WorldDatabase\.Info[[:space:]]*=.*|WorldDatabase.Info              = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};mangos\"|" \
-        -e "s|^CharacterDatabase\.Info[[:space:]]*=.*|CharacterDatabase.Info          = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};characters\"|" \
-        -e "s|^LogsDatabase\.Info[[:space:]]*=.*|LogsDatabase.Info               = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};logs\"|" \
+        -e "s|^LoginDatabase\.Info[[:space:]]*=.*|LoginDatabase.Info              = \"${db_conn};realmd\"|" \
+        -e "s|^WorldDatabase\.Info[[:space:]]*=.*|WorldDatabase.Info              = \"${db_conn};mangos\"|" \
+        -e "s|^CharacterDatabase\.Info[[:space:]]*=.*|CharacterDatabase.Info          = \"${db_conn};characters\"|" \
+        -e "s|^LogsDatabase\.Info[[:space:]]*=.*|LogsDatabase.Info               = \"${db_conn};logs\"|" \
         -e "s|^WorldServerPort[[:space:]]*=.*|WorldServerPort = ${WORLD_PORT}|" \
         -e "s|^RealmID[[:space:]]*=.*|RealmID = ${REALM_ID}|" \
         -e "s|^GameType[[:space:]]*=.*|GameType = ${GAME_TYPE}|" \
@@ -626,13 +640,16 @@ _render_mangosd_conf() {
 # _render_realmd_conf <src> <dst> <logs_dir>
 _render_realmd_conf() {
     local src="$1" dst="$2" logs_dir="$3"
+    # sed-replacement escaping — see _render_mangosd_conf.
+    logs_dir="$(_sed_escape "$logs_dir")"
+    local db_conn; db_conn="$(_sed_escape "${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS}")"
     cp "$src" "$dst"
     # See the matching comment in _render_mangosd_conf — same CRLF-source,
     # mixed-line-ending issue applies here too.
     sed -i 's/\r$//' "$dst"
     sed -i \
         -e "s|^LogsDir[[:space:]]*=.*|LogsDir = \"${logs_dir}\"|" \
-        -e "s|^LoginDatabaseInfo[[:space:]]*=.*|LoginDatabaseInfo = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};realmd\"|" \
+        -e "s|^LoginDatabaseInfo[[:space:]]*=.*|LoginDatabaseInfo = \"${db_conn};realmd\"|" \
         -e "s|^RealmServerPort[[:space:]]*=.*|RealmServerPort = ${REALM_PORT}|" \
         -e "s|^WrongPass\.MaxCount[[:space:]]*=.*|WrongPass.MaxCount = ${WRONG_PASS_MAX_COUNT}|" \
         -e "s|^WrongPass\.BanTime[[:space:]]*=.*|WrongPass.BanTime = ${WRONG_PASS_BAN_TIME}|" \
@@ -1541,7 +1558,6 @@ cmd_stop_docker() {
 # storage backend (hostPath vs StorageClass) and paths come from config.
 # -----------------------------------------------------------------------------
 
-_sed_escape() { printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'; }
 # Escapes a value for embedding inside a double-quoted YAML scalar
 # ("__TOKEN__" in the templates): backslash first, then the quote itself.
 _yaml_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
