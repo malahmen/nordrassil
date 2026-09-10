@@ -894,8 +894,13 @@ _detect_running_target() {
     pf_is_running "${PF_DIR}/mangosd.pid" && targets+=("local")
     [[ "$(docker inspect --type container "$SERVER_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]] \
         && targets+=("docker")
+    # Same --context/--kind target as the exec path below — otherwise the
+    # detection looks at the ambient kube context while the console command
+    # goes to the requested one.
+    local ctx_flags; ctx_flags="$(kubectl_context_flag)"
     if command -v kubectl &>/dev/null; then
-        kubectl get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server --no-headers 2>/dev/null | grep -q Running \
+        # shellcheck disable=SC2086
+        kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server --no-headers 2>/dev/null | grep -q Running \
             && targets+=("k8s")
     fi
 
@@ -919,13 +924,15 @@ _detect_running_target() {
         fi
     fi
 
-    # k8s only: resolve once here, rather than in every caller — K8S_CTX_FLAGS/
-    # K8S_POD are globals _send_console_cmd/_db_query read for the k8s case.
-    K8S_CTX_FLAGS="" K8S_POD=""
+    # k8s only: make sure a pod is actually addressable. Callers run this
+    # function in a $(...) subshell, so nothing assigned here survives —
+    # _send_console_cmd/_db_query resolve the context flags and pod name
+    # themselves for the k8s case.
     if [[ "$chosen" == "k8s" ]]; then
-        K8S_CTX_FLAGS="$(kubectl_context_flag)"
-        K8S_POD=$(kubectl $K8S_CTX_FLAGS get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-        if [[ -z "$K8S_POD" ]]; then
+        local pod
+        # shellcheck disable=SC2086
+        pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [[ -z "$pod" ]]; then
             warn "No running vanilla-wow-server pod found in namespace ${K8S_NAMESPACE}."
             return 1
         fi
@@ -947,7 +954,10 @@ _detect_db_target() {
         return 0
     fi
     if command -v kubectl &>/dev/null; then
-        if kubectl get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb --no-headers 2>/dev/null | grep -q Running; then
+        # Same --context/--kind target _db_query uses for the k8s case.
+        local ctx_flags; ctx_flags="$(kubectl_context_flag)"
+        # shellcheck disable=SC2086
+        if kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb --no-headers 2>/dev/null | grep -q Running; then
             echo "k8s"
             return 0
         fi
@@ -1009,7 +1019,6 @@ _db_query_raw() {
 }
 
 # _send_console_cmd <local|docker|k8s> <single console command line>
-# Globals used for the k8s case: K8S_CTX_FLAGS, K8S_POD (set by the caller).
 _send_console_cmd() {
     local tgt="$1" line="$2"
     case "$tgt" in
@@ -1026,7 +1035,17 @@ _send_console_cmd() {
                 || { warn "Failed to reach the container's console FIFO."; return 1; }
             ;;
         k8s)
-            printf '%s\n' "$line" | kubectl $K8S_CTX_FLAGS exec -i -n "$K8S_NAMESPACE" "$K8S_POD" -- sh -c "cat > /app/mangosd.stdin" \
+            # Same --context/--kind resolution as _db_query's k8s case.
+            local ctx_flags pod
+            ctx_flags="$(kubectl_context_flag)"
+            # shellcheck disable=SC2086
+            pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            if [[ -z "$pod" ]]; then
+                warn "No running vanilla-wow-server pod found in namespace ${K8S_NAMESPACE}."
+                return 1
+            fi
+            # shellcheck disable=SC2086
+            printf '%s\n' "$line" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- sh -c "cat > /app/mangosd.stdin" \
                 || { warn "Failed to reach the pod's console FIFO."; return 1; }
             ;;
     esac
@@ -1067,7 +1086,7 @@ cmd_create_account() {
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs ${K8S_POD}" ;;
+        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
     esac
 
     success "Account '${user_input}' created (GM level: ${gm_num})."
@@ -1140,7 +1159,7 @@ cmd_delete_account() {
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs ${K8S_POD}" ;;
+        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
     esac
 
     success "Delete command sent for '${user_input}'."
@@ -1168,7 +1187,7 @@ cmd_set_account_level() {
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs ${K8S_POD}" ;;
+        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
     esac
 
     success "GM level command sent for '${user_input}' (level: ${gm_num})."
