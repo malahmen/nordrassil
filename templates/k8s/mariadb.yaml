@@ -23,7 +23,10 @@ spec:
           image: mariadb:11
           env:
             - name: MARIADB_ROOT_PASSWORD
-              value: "__DB_PASS__"
+              valueFrom:
+                secretKeyRef:
+                  name: vanilla-wow-db
+                  key: password
           ports:
             - containerPort: 3306
           volumeMounts:

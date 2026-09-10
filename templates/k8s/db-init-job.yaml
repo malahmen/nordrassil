@@ -13,7 +13,10 @@ spec:
           image: mariadb:11
           env:
             - name: DB_PASS
-              value: "__DB_PASS__"
+              valueFrom:
+                secretKeyRef:
+                  name: vanilla-wow-db
+                  key: password
             - name: REALM_ID
               value: "__REALM_ID__"
             - name: REALM_NAME
