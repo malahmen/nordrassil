@@ -67,15 +67,30 @@ _require_sudo_or_instruct() {
     error_exit "Run it yourself, then re-run:
   $*"
 }
+# rpm-ostree layers packages into a new deployment that only takes effect
+# after a reboot, and every 'rpm-ostree install' is a separate (slow)
+# transaction — so on those hosts _ensure_pkg/_ensure_pkgs only queue what's
+# missing here, and cmd_install_deps layers the whole list in one go
+# (_layer_rpm_ostree_pending). Per-package installs used to 'return 1' after
+# the first one, which under set -e aborted install-deps right there.
+RPM_OSTREE_PENDING=()
+_layer_rpm_ostree_pending() {
+    [[ ${#RPM_OSTREE_PENDING[@]} -gt 0 ]] || return 0
+    local pkgs="${RPM_OSTREE_PENDING[*]}"
+    _require_sudo_or_instruct "Layering packages" "sudo rpm-ostree install -y --idempotent --allow-inactive ${pkgs} (then reboot)"
+    # --idempotent: already-layered packages aren't an error; --allow-inactive:
+    # nor are ones the base image already ships.
+    sudo rpm-ostree install -y --idempotent --allow-inactive "${RPM_OSTREE_PENDING[@]}" \
+        || error_exit "rpm-ostree install failed for: ${pkgs}"
+    warn "Layered via rpm-ostree: ${pkgs} — reboot, then re-run 'install-deps' to finish (ACE build)."
+}
 # _ensure_pkg <check-bin> <dnf-pkg> [apt-pkg]
 _ensure_pkg() {
     local bin="$1" dnf_pkg="$2" apt_pkg="${3:-$2}" pm
     command -v "$bin" &>/dev/null && { info "${bin} found."; return 0; }
     pm="$(_pkg_manager)"; [[ -n "$pm" ]] || error_exit "No supported package manager (dnf/apt/rpm-ostree) to install '${dnf_pkg}'."
     case "$pm" in
-        rpm-ostree) _require_sudo_or_instruct "Layering ${dnf_pkg}" "rpm-ostree install -y ${dnf_pkg} (then reboot)"
-                    rpm-ostree install -y "$dnf_pkg" || error_exit "rpm-ostree install failed for ${dnf_pkg}."
-                    warn "Layered via rpm-ostree — reboot before '${bin}' is available."; return 1 ;;
+        rpm-ostree) info "${bin} missing — queued for layering (${dnf_pkg})."; RPM_OSTREE_PENDING+=("$dnf_pkg"); return 0 ;;
         dnf)  _require_sudo_or_instruct "Installing ${dnf_pkg}" "sudo dnf install -y ${dnf_pkg}"; sudo dnf install -y "$dnf_pkg" || error_exit "dnf install failed for ${dnf_pkg}." ;;
         apt)  _require_sudo_or_instruct "Installing ${apt_pkg}" "sudo apt-get update -qq && sudo apt-get install -y ${apt_pkg}"; sudo apt-get update -qq && sudo apt-get install -y "$apt_pkg" || error_exit "apt install failed for ${apt_pkg}." ;;
     esac
@@ -88,7 +103,7 @@ _ensure_pkgs() {
     [[ -n "$pm" ]] || error_exit "No supported package manager (dnf/apt/rpm-ostree)."
     # shellcheck disable=SC2086
     case "$pm" in
-        rpm-ostree) _require_sudo_or_instruct "Layering packages" "rpm-ostree install -y ${dnf_pkgs}"; rpm-ostree install -y $dnf_pkgs || warn "Some packages may already be layered." ;;
+        rpm-ostree) info "Queued for layering: ${dnf_pkgs}"; local -a more; read -ra more <<<"$dnf_pkgs"; RPM_OSTREE_PENDING+=("${more[@]}"); return 0 ;;
         dnf)  _require_sudo_or_instruct "Installing packages" "sudo dnf install -y ${dnf_pkgs}"; sudo dnf install -y $dnf_pkgs || error_exit "dnf install failed." ;;
         apt)  _require_sudo_or_instruct "Installing packages" "sudo apt-get update -qq && sudo apt-get install -y ${apt_pkgs}"; sudo apt-get update -qq && sudo apt-get install -y $apt_pkgs || error_exit "apt install failed." ;;
     esac
@@ -162,15 +177,24 @@ ACE_DEPS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ace-wrappers/${ACE_BUILD_VERSION}/
 # that partial get/set beats dozzle.sh's plain whole-file source)
 # -----------------------------------------------------------------------------
 
+# Escapes a value for use as the replacement text of a sed 's|...|...|'
+# command (backslash, '&', and the '|' delimiter every sed call in this
+# script uses). Shared by cfg_set, the conf renderers and render_template.
+_sed_escape() { printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'; }
+
 cfg_get() {
     grep -E "^${1}=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' || true
 }
 cfg_set() {
     local key="$1" val="$2" quoted
+    # The key is spliced into a regex and the value into a sed replacement;
+    # the file is one key=value per line, so neither may carry a newline.
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || error_exit "set: invalid key '${key}' (letters, digits, underscore)."
+    [[ "$val" != *$'\n'* ]] || error_exit "set: ${key}: value must not contain a newline."
     quoted="\"${val}\""
     touch "$CONFIG_FILE"
     if grep -qE "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-        sed -i.bak "s|^${key}=.*|${key}=${quoted}|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+        sed -i.bak "s|^${key}=.*|${key}=$(_sed_escape "$quoted")|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
     else
         echo "${key}=${quoted}" >> "$CONFIG_FILE"
     fi
@@ -196,7 +220,12 @@ _detect_lan_ip() {
 }
 
 _settings() {
+    # Paths the front-end may hand over with a literal leading '~' (a quoted
+    # 'set SOURCE_DIR ~/x' never reaches the shell's own tilde expansion) —
+    # expand it the same way CONFIG_DIR is, so it isn't mkdir'd/mounted as a
+    # directory literally named '~'.
     SOURCE_DIR="$(cfg_default SOURCE_DIR "${HOME}/jaws/MaNGOS")"
+    SOURCE_DIR="${SOURCE_DIR/#\~/$HOME}"
     CLIENT_BUILD="$(cfg_default CLIENT_BUILD "$CLIENT_BUILD_DEFAULT")"
     DB_HOST="$(cfg_default DB_HOST 127.0.0.1)"
     DB_PORT="$(cfg_default DB_PORT 3306)"
@@ -253,7 +282,9 @@ _settings() {
     # k8s storage (set by the front-end): hostpath | storageclass, + paths/class.
     K8S_STORAGE_TYPE="$(cfg_default K8S_STORAGE_TYPE hostpath)"
     K8S_DATA_HOSTPATH="$(cfg_default K8S_DATA_HOSTPATH "${SOURCE_DIR}/data")"
+    K8S_DATA_HOSTPATH="${K8S_DATA_HOSTPATH/#\~/$HOME}"
     K8S_DB_HOSTPATH="$(cfg_default K8S_DB_HOSTPATH /var/vanilla-wow-mariadb)"
+    K8S_DB_HOSTPATH="${K8S_DB_HOSTPATH/#\~/$HOME}"
     K8S_STORAGECLASS="$(cfg_default K8S_STORAGECLASS "")"
 }
 
@@ -346,12 +377,25 @@ cmd_install_deps() {
     header "nordrassil — Install dependencies"
 
     info "Build toolchain (for the local native path)..."
+    # git: _apply_source_patches (git apply); make: the cmake build and the
+    # ACE from-source build; unzip: _unpack_source; curl/tar: the ACE download.
     _ensure_pkg git    git    git
     _ensure_pkg cmake  cmake  cmake
     _ensure_pkg g++    gcc-c++ g++
-    _ensure_pkgs "tbb-devel mariadb-devel openssl-devel zlib-ng-compat-devel p7zip" \
-                 "libtbb-dev default-libmysqlclient-dev libssl-dev zlib1g-dev p7zip-full"
-    _ensure_ace || true
+    _ensure_pkg make   make   make
+    _ensure_pkg unzip  unzip  unzip
+    _ensure_pkg curl   curl   curl
+    _ensure_pkg tar    tar    tar
+    _ensure_pkgs "tbb-devel mariadb-devel openssl-devel zlib-ng-compat-devel" \
+                 "libtbb-dev default-libmysqlclient-dev libssl-dev zlib1g-dev"
+    _layer_rpm_ostree_pending
+    if [[ ${#RPM_OSTREE_PENDING[@]} -gt 0 ]]; then
+        # The toolchain just layered isn't usable until the reboot, so the
+        # ACE from-source build would only fail here — deferred to the re-run.
+        warn "Skipping the ACE check until after the reboot."
+    else
+        _ensure_ace || true
+    fi
 
     info "Docker (required for the DB container and the Docker/k8s deployment paths)..."
     _check_docker
@@ -525,9 +569,13 @@ _db_bootstrap() {
 # sync with the current REALM_ADDRESS/WORLD_PORT/CLIENT_BUILD on every run.
 _ensure_realmlist() {
     info "Ensuring realmlist row (id=${REALM_ID}, name=${REALM_NAME}, address=${REALM_ADDRESS}:${WORLD_PORT})..."
+    # Both values are operator-supplied free text (the front-end takes them
+    # from a prompt) — escape them like every other string literal here.
+    local name_sql addr_sql
+    name_sql="$(_sql_escape "$REALM_NAME")"; addr_sql="$(_sql_escape "$REALM_ADDRESS")"
     _db_exec "INSERT INTO realmd.realmlist (id, name, address, localAddress, localSubnetMask, port, gamebuild_min, gamebuild_max)
-        VALUES (${REALM_ID}, '${REALM_NAME}', '${REALM_ADDRESS}', '127.0.0.1', '255.255.255.0', ${WORLD_PORT}, ${CLIENT_BUILD}, ${CLIENT_BUILD})
-        ON DUPLICATE KEY UPDATE name='${REALM_NAME}', address='${REALM_ADDRESS}', port=${WORLD_PORT}, gamebuild_min=${CLIENT_BUILD}, gamebuild_max=${CLIENT_BUILD};" \
+        VALUES (${REALM_ID}, '${name_sql}', '${addr_sql}', '127.0.0.1', '255.255.255.0', ${WORLD_PORT}, ${CLIENT_BUILD}, ${CLIENT_BUILD})
+        ON DUPLICATE KEY UPDATE name='${name_sql}', address='${addr_sql}', port=${WORLD_PORT}, gamebuild_min=${CLIENT_BUILD}, gamebuild_max=${CLIENT_BUILD};" \
         || error_exit "Failed to write the realmlist row."
     success "realmlist ready."
 }
@@ -542,6 +590,11 @@ _ensure_realmlist() {
 _render_mangosd_conf() {
     local src="$1" dst="$2" data_dir="$3" logs_dir="$4" warden_dir="$5"
     local motd_escaped; motd_escaped="$(_sed_escape "$MOTD")"
+    # Everything spliced into a sed replacement below goes through
+    # _sed_escape — a DB password or path containing '&', '|' or '\' would
+    # otherwise corrupt the line (or, with '|', break the sed command).
+    data_dir="$(_sed_escape "$data_dir")"; logs_dir="$(_sed_escape "$logs_dir")"; warden_dir="$(_sed_escape "$warden_dir")"
+    local db_conn; db_conn="$(_sed_escape "${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS}")"
     cp "$src" "$dst"
     # The repack's conf files ship with Windows CRLF line endings (they were
     # distributed alongside .exe binaries). Left as-is, sed's substitutions
@@ -557,10 +610,10 @@ _render_mangosd_conf() {
         -e "s|^Warden\.WinEnabled[[:space:]]*=.*|Warden.WinEnabled            = ${WARDEN_ENABLED}|" \
         -e "s|^Warden\.OSXEnabled[[:space:]]*=.*|Warden.OSXEnabled            = ${WARDEN_ENABLED}|" \
         -e "s|^StrictPlayerNames[[:space:]]*=.*|StrictPlayerNames = ${STRICT_PLAYER_NAMES}|" \
-        -e "s|^LoginDatabase\.Info[[:space:]]*=.*|LoginDatabase.Info              = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};realmd\"|" \
-        -e "s|^WorldDatabase\.Info[[:space:]]*=.*|WorldDatabase.Info              = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};mangos\"|" \
-        -e "s|^CharacterDatabase\.Info[[:space:]]*=.*|CharacterDatabase.Info          = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};characters\"|" \
-        -e "s|^LogsDatabase\.Info[[:space:]]*=.*|LogsDatabase.Info               = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};logs\"|" \
+        -e "s|^LoginDatabase\.Info[[:space:]]*=.*|LoginDatabase.Info              = \"${db_conn};realmd\"|" \
+        -e "s|^WorldDatabase\.Info[[:space:]]*=.*|WorldDatabase.Info              = \"${db_conn};mangos\"|" \
+        -e "s|^CharacterDatabase\.Info[[:space:]]*=.*|CharacterDatabase.Info          = \"${db_conn};characters\"|" \
+        -e "s|^LogsDatabase\.Info[[:space:]]*=.*|LogsDatabase.Info               = \"${db_conn};logs\"|" \
         -e "s|^WorldServerPort[[:space:]]*=.*|WorldServerPort = ${WORLD_PORT}|" \
         -e "s|^RealmID[[:space:]]*=.*|RealmID = ${REALM_ID}|" \
         -e "s|^GameType[[:space:]]*=.*|GameType = ${GAME_TYPE}|" \
@@ -587,13 +640,16 @@ _render_mangosd_conf() {
 # _render_realmd_conf <src> <dst> <logs_dir>
 _render_realmd_conf() {
     local src="$1" dst="$2" logs_dir="$3"
+    # sed-replacement escaping — see _render_mangosd_conf.
+    logs_dir="$(_sed_escape "$logs_dir")"
+    local db_conn; db_conn="$(_sed_escape "${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS}")"
     cp "$src" "$dst"
     # See the matching comment in _render_mangosd_conf — same CRLF-source,
     # mixed-line-ending issue applies here too.
     sed -i 's/\r$//' "$dst"
     sed -i \
         -e "s|^LogsDir[[:space:]]*=.*|LogsDir = \"${logs_dir}\"|" \
-        -e "s|^LoginDatabaseInfo[[:space:]]*=.*|LoginDatabaseInfo = \"${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS};realmd\"|" \
+        -e "s|^LoginDatabaseInfo[[:space:]]*=.*|LoginDatabaseInfo = \"${db_conn};realmd\"|" \
         -e "s|^RealmServerPort[[:space:]]*=.*|RealmServerPort = ${REALM_PORT}|" \
         -e "s|^WrongPass\.MaxCount[[:space:]]*=.*|WrongPass.MaxCount = ${WRONG_PASS_MAX_COUNT}|" \
         -e "s|^WrongPass\.BanTime[[:space:]]*=.*|WrongPass.BanTime = ${WRONG_PASS_BAN_TIME}|" \
@@ -894,8 +950,13 @@ _detect_running_target() {
     pf_is_running "${PF_DIR}/mangosd.pid" && targets+=("local")
     [[ "$(docker inspect --type container "$SERVER_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]] \
         && targets+=("docker")
+    # Same --context/--kind target as the exec path below — otherwise the
+    # detection looks at the ambient kube context while the console command
+    # goes to the requested one.
+    local ctx_flags; ctx_flags="$(kubectl_context_flag)"
     if command -v kubectl &>/dev/null; then
-        kubectl get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server --no-headers 2>/dev/null | grep -q Running \
+        # shellcheck disable=SC2086
+        kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server --no-headers 2>/dev/null | grep -q Running \
             && targets+=("k8s")
     fi
 
@@ -919,13 +980,15 @@ _detect_running_target() {
         fi
     fi
 
-    # k8s only: resolve once here, rather than in every caller — K8S_CTX_FLAGS/
-    # K8S_POD are globals _send_console_cmd/_db_query read for the k8s case.
-    K8S_CTX_FLAGS="" K8S_POD=""
+    # k8s only: make sure a pod is actually addressable. Callers run this
+    # function in a $(...) subshell, so nothing assigned here survives —
+    # _send_console_cmd/_db_query resolve the context flags and pod name
+    # themselves for the k8s case.
     if [[ "$chosen" == "k8s" ]]; then
-        K8S_CTX_FLAGS="$(kubectl_context_flag)"
-        K8S_POD=$(kubectl $K8S_CTX_FLAGS get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-        if [[ -z "$K8S_POD" ]]; then
+        local pod
+        # shellcheck disable=SC2086
+        pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [[ -z "$pod" ]]; then
             warn "No running vanilla-wow-server pod found in namespace ${K8S_NAMESPACE}."
             return 1
         fi
@@ -947,7 +1010,10 @@ _detect_db_target() {
         return 0
     fi
     if command -v kubectl &>/dev/null; then
-        if kubectl get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb --no-headers 2>/dev/null | grep -q Running; then
+        # Same --context/--kind target _db_query uses for the k8s case.
+        local ctx_flags; ctx_flags="$(kubectl_context_flag)"
+        # shellcheck disable=SC2086
+        if kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb --no-headers 2>/dev/null | grep -q Running; then
             echo "k8s"
             return 0
         fi
@@ -1009,7 +1075,6 @@ _db_query_raw() {
 }
 
 # _send_console_cmd <local|docker|k8s> <single console command line>
-# Globals used for the k8s case: K8S_CTX_FLAGS, K8S_POD (set by the caller).
 _send_console_cmd() {
     local tgt="$1" line="$2"
     case "$tgt" in
@@ -1026,10 +1091,32 @@ _send_console_cmd() {
                 || { warn "Failed to reach the container's console FIFO."; return 1; }
             ;;
         k8s)
-            printf '%s\n' "$line" | kubectl $K8S_CTX_FLAGS exec -i -n "$K8S_NAMESPACE" "$K8S_POD" -- sh -c "cat > /app/mangosd.stdin" \
+            # Same --context/--kind resolution as _db_query's k8s case.
+            local ctx_flags pod
+            ctx_flags="$(kubectl_context_flag)"
+            # shellcheck disable=SC2086
+            pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            if [[ -z "$pod" ]]; then
+                warn "No running vanilla-wow-server pod found in namespace ${K8S_NAMESPACE}."
+                return 1
+            fi
+            # shellcheck disable=SC2086
+            printf '%s\n' "$line" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- sh -c "cat > /app/mangosd.stdin" \
                 || { warn "Failed to reach the pod's console FIFO."; return 1; }
             ;;
     esac
+}
+
+# _validate_console_arg <label> <value> — gate for anything that ends up as a
+# word in a mangosd console line ('account create NAME PASS', 'account set
+# gmlevel NAME N'). The console splits on whitespace and takes one command
+# per line, so a space would shift the arguments and an embedded newline
+# would inject a second command. Printable only, no whitespace/control
+# characters, 1-16 chars (MAX_ACCOUNT_STR/MAX_PASSWORD_STR in the source).
+_validate_console_arg() {
+    local label="$1" value="$2"
+    [[ "$value" =~ ^[[:graph:]]{1,16}$ ]] \
+        || error_exit "${label} must be 1-16 printable characters with no whitespace or control characters."
 }
 
 cmd_create_account() {
@@ -1046,6 +1133,8 @@ cmd_create_account() {
     esac; done
     [[ -n "$user_input" ]] || error_exit "create-account: --name is required."
     [[ -n "$pass_input" ]] || error_exit "create-account: --pass is required."
+    _validate_console_arg "create-account: --name" "$user_input"
+    _validate_console_arg "create-account: --pass" "$pass_input"
     [[ "$gm_num" =~ ^[0-6]$ ]] || error_exit "create-account: --level must be 0-6 (see the GM-level scale)."
 
     local target
@@ -1067,7 +1156,7 @@ cmd_create_account() {
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs ${K8S_POD}" ;;
+        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
     esac
 
     success "Account '${user_input}' created (GM level: ${gm_num})."
@@ -1113,6 +1202,7 @@ cmd_delete_account() {
         *) error_exit "delete-account: unknown flag: $1" ;;
     esac; done
     [[ -n "$user_input" ]] || error_exit "delete-account: --name is required."
+    _validate_console_arg "delete-account: --name" "$user_input"
 
     # Destructive (also removes the account's characters). The front-end confirms
     # before calling; the engine executes the named deletion directly.
@@ -1122,8 +1212,8 @@ cmd_delete_account() {
     # Needed for the account_access cleanup below: that row can only be
     # looked up by account id, and 'account delete' removes the account row
     # itself, so the id has to be captured before the console command runs.
-    local acc_id
-    acc_id=$(_db_query_raw "$target" "SELECT id FROM realmd.account WHERE username='${user_input^^}';" 2>/dev/null)
+    local acc_id user_sql; user_sql="$(_sql_escape "${user_input^^}")"
+    acc_id=$(_db_query_raw "$target" "SELECT id FROM realmd.account WHERE username='${user_sql}';" 2>/dev/null)
 
     _send_console_cmd "$target" "account delete ${user_input}" || return 1
 
@@ -1140,7 +1230,7 @@ cmd_delete_account() {
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs ${K8S_POD}" ;;
+        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
     esac
 
     success "Delete command sent for '${user_input}'."
@@ -1158,6 +1248,7 @@ cmd_set_account_level() {
         *) error_exit "set-account-level: unknown flag: $1" ;;
     esac; done
     [[ -n "$user_input" ]] || error_exit "set-account-level: --name is required."
+    _validate_console_arg "set-account-level: --name" "$user_input"
     [[ "$gm_num" =~ ^[0-6]$ ]] || error_exit "set-account-level: --level must be 0-6."
 
     local target
@@ -1168,7 +1259,7 @@ cmd_set_account_level() {
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs ${K8S_POD}" ;;
+        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
     esac
 
     success "GM level command sent for '${user_input}' (level: ${gm_num})."
@@ -1467,7 +1558,9 @@ cmd_stop_docker() {
 # storage backend (hostPath vs StorageClass) and paths come from config.
 # -----------------------------------------------------------------------------
 
-_sed_escape() { printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'; }
+# Escapes a value for embedding inside a double-quoted YAML scalar
+# ("__TOKEN__" in the templates): backslash first, then the quote itself.
+_yaml_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 # render_template <template-file> <token1=value1> [...]
 # Single-line token substitution only — do not pass multi-line values (sed
@@ -1604,13 +1697,12 @@ cmd_run_k8s() {
     echo "---" >> "$manifest"
     inject_block "${k8s_tpl}/mariadb.yaml" "DB_SOURCE" "$db_source_file" \
         | render_template /dev/stdin "NAMESPACE=${K8S_NAMESPACE}" >> "$manifest"
-    echo "---" >> "$manifest"
-    inject_block "${k8s_tpl}/server.yaml" "DATA_SOURCE" "$data_source_file" \
-        | render_template /dev/stdin \
-            "NAMESPACE=${K8S_NAMESPACE}" "IMAGE_TAG=${IMAGE_TAG}" \
-            "REALM_PORT=${REALM_PORT}" "WORLD_PORT=${WORLD_PORT}" >> "$manifest"
 
-    info "Applying manifests..."
+    # server.yaml is deliberately NOT part of this manifest — it's applied
+    # last, after the db-init Job has completed (see below). entrypoint.sh
+    # has no DB-wait of its own, so a server pod started alongside the Job
+    # crash-loops for the whole world-dump import on a first deploy.
+    info "Applying manifests (namespace, storage, mariadb)..."
     # shellcheck disable=SC2086
     kubectl $ctx_flags apply -f "$manifest" || error_exit "kubectl apply failed."
 
@@ -1635,9 +1727,15 @@ cmd_run_k8s() {
         || error_exit "Failed to create the server ConfigMap."
 
     info "Running DB bootstrap Job (schemas + world dump + migrations)..."
+    # A Job's pod template is immutable once created, so re-applying it with
+    # anything changed (realm address, password, sql path) fails — delete
+    # any previous run first (also drops its completed/failed pods).
+    # shellcheck disable=SC2086
+    kubectl $ctx_flags -n "$K8S_NAMESPACE" delete job vanilla-wow-db-init --ignore-not-found \
+        || error_exit "Failed to remove the previous db-init Job."
     render_template "${k8s_tpl}/db-init-job.yaml" \
         "NAMESPACE=${K8S_NAMESPACE}" \
-        "REALM_ID=${REALM_ID}" "REALM_NAME=${REALM_NAME}" "REALM_ADDRESS=${REALM_ADDRESS}" \
+        "REALM_ID=${REALM_ID}" "REALM_NAME=$(_yaml_escape "$REALM_NAME")" "REALM_ADDRESS=$(_yaml_escape "$REALM_ADDRESS")" \
         "WORLD_PORT=${WORLD_PORT}" "CLIENT_BUILD=${CLIENT_BUILD}" \
         "SQL_HOSTPATH=${SOURCE_DIR}/sql" > "$job_manifest"
     # shellcheck disable=SC2086
@@ -1645,7 +1743,16 @@ cmd_run_k8s() {
     # shellcheck disable=SC2086
     info "Waiting for db-init Job to complete (world dump import can take a while)..."
         kubectl $ctx_flags -n "$K8S_NAMESPACE" wait --for=condition=complete job/vanilla-wow-db-init --timeout=900s \
-        || warn "db-init Job did not complete in time. Check: kubectl -n ${K8S_NAMESPACE} logs job/vanilla-wow-db-init"
+        || warn "db-init Job did not complete in time — deploying the server anyway (it restarts until the DB is ready). Check: kubectl -n ${K8S_NAMESPACE} logs job/vanilla-wow-db-init"
+
+    # Only now that the DB is bootstrapped: the server Deployment.
+    info "Applying server deployment..."
+    # shellcheck disable=SC2086
+    inject_block "${k8s_tpl}/server.yaml" "DATA_SOURCE" "$data_source_file" \
+        | render_template /dev/stdin \
+            "NAMESPACE=${K8S_NAMESPACE}" "IMAGE_TAG=${IMAGE_TAG}" \
+            "REALM_PORT=${REALM_PORT}" "WORLD_PORT=${WORLD_PORT}" \
+        | kubectl $ctx_flags apply -f - || error_exit "server deployment apply failed."
 
     # shellcheck disable=SC2086
     info "Waiting for server rollout..."
