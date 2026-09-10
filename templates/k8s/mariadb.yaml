@@ -5,6 +5,11 @@ metadata:
   namespace: __NAMESPACE__
 spec:
   replicas: 1
+  # Recreate, not RollingUpdate: the data directory is a single hostPath/
+  # RWO volume — two mariadb pods overlapping on it during a rollout would
+  # both try to own the same InnoDB files.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vanilla-wow-mariadb
@@ -18,7 +23,10 @@ spec:
           image: mariadb:11
           env:
             - name: MARIADB_ROOT_PASSWORD
-              value: "__DB_PASS__"
+              valueFrom:
+                secretKeyRef:
+                  name: vanilla-wow-db
+                  key: password
           ports:
             - containerPort: 3306
           volumeMounts:
