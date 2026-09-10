@@ -525,9 +525,13 @@ _db_bootstrap() {
 # sync with the current REALM_ADDRESS/WORLD_PORT/CLIENT_BUILD on every run.
 _ensure_realmlist() {
     info "Ensuring realmlist row (id=${REALM_ID}, name=${REALM_NAME}, address=${REALM_ADDRESS}:${WORLD_PORT})..."
+    # Both values are operator-supplied free text (the front-end takes them
+    # from a prompt) — escape them like every other string literal here.
+    local name_sql addr_sql
+    name_sql="$(_sql_escape "$REALM_NAME")"; addr_sql="$(_sql_escape "$REALM_ADDRESS")"
     _db_exec "INSERT INTO realmd.realmlist (id, name, address, localAddress, localSubnetMask, port, gamebuild_min, gamebuild_max)
-        VALUES (${REALM_ID}, '${REALM_NAME}', '${REALM_ADDRESS}', '127.0.0.1', '255.255.255.0', ${WORLD_PORT}, ${CLIENT_BUILD}, ${CLIENT_BUILD})
-        ON DUPLICATE KEY UPDATE name='${REALM_NAME}', address='${REALM_ADDRESS}', port=${WORLD_PORT}, gamebuild_min=${CLIENT_BUILD}, gamebuild_max=${CLIENT_BUILD};" \
+        VALUES (${REALM_ID}, '${name_sql}', '${addr_sql}', '127.0.0.1', '255.255.255.0', ${WORLD_PORT}, ${CLIENT_BUILD}, ${CLIENT_BUILD})
+        ON DUPLICATE KEY UPDATE name='${name_sql}', address='${addr_sql}', port=${WORLD_PORT}, gamebuild_min=${CLIENT_BUILD}, gamebuild_max=${CLIENT_BUILD};" \
         || error_exit "Failed to write the realmlist row."
     success "realmlist ready."
 }
@@ -1032,6 +1036,18 @@ _send_console_cmd() {
     esac
 }
 
+# _validate_console_arg <label> <value> — gate for anything that ends up as a
+# word in a mangosd console line ('account create NAME PASS', 'account set
+# gmlevel NAME N'). The console splits on whitespace and takes one command
+# per line, so a space would shift the arguments and an embedded newline
+# would inject a second command. Printable only, no whitespace/control
+# characters, 1-16 chars (MAX_ACCOUNT_STR/MAX_PASSWORD_STR in the source).
+_validate_console_arg() {
+    local label="$1" value="$2"
+    [[ "$value" =~ ^[[:graph:]]{1,16}$ ]] \
+        || error_exit "${label} must be 1-16 printable characters with no whitespace or control characters."
+}
+
 cmd_create_account() {
     header "nordrassil — Create account"
     _settings
@@ -1046,6 +1062,8 @@ cmd_create_account() {
     esac; done
     [[ -n "$user_input" ]] || error_exit "create-account: --name is required."
     [[ -n "$pass_input" ]] || error_exit "create-account: --pass is required."
+    _validate_console_arg "create-account: --name" "$user_input"
+    _validate_console_arg "create-account: --pass" "$pass_input"
     [[ "$gm_num" =~ ^[0-6]$ ]] || error_exit "create-account: --level must be 0-6 (see the GM-level scale)."
 
     local target
@@ -1113,6 +1131,7 @@ cmd_delete_account() {
         *) error_exit "delete-account: unknown flag: $1" ;;
     esac; done
     [[ -n "$user_input" ]] || error_exit "delete-account: --name is required."
+    _validate_console_arg "delete-account: --name" "$user_input"
 
     # Destructive (also removes the account's characters). The front-end confirms
     # before calling; the engine executes the named deletion directly.
@@ -1122,8 +1141,8 @@ cmd_delete_account() {
     # Needed for the account_access cleanup below: that row can only be
     # looked up by account id, and 'account delete' removes the account row
     # itself, so the id has to be captured before the console command runs.
-    local acc_id
-    acc_id=$(_db_query_raw "$target" "SELECT id FROM realmd.account WHERE username='${user_input^^}';" 2>/dev/null)
+    local acc_id user_sql; user_sql="$(_sql_escape "${user_input^^}")"
+    acc_id=$(_db_query_raw "$target" "SELECT id FROM realmd.account WHERE username='${user_sql}';" 2>/dev/null)
 
     _send_console_cmd "$target" "account delete ${user_input}" || return 1
 
@@ -1158,6 +1177,7 @@ cmd_set_account_level() {
         *) error_exit "set-account-level: unknown flag: $1" ;;
     esac; done
     [[ -n "$user_input" ]] || error_exit "set-account-level: --name is required."
+    _validate_console_arg "set-account-level: --name" "$user_input"
     [[ "$gm_num" =~ ^[0-6]$ ]] || error_exit "set-account-level: --level must be 0-6."
 
     local target
@@ -1468,6 +1488,9 @@ cmd_stop_docker() {
 # -----------------------------------------------------------------------------
 
 _sed_escape() { printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'; }
+# Escapes a value for embedding inside a double-quoted YAML scalar
+# ("__TOKEN__" in the templates): backslash first, then the quote itself.
+_yaml_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 # render_template <template-file> <token1=value1> [...]
 # Single-line token substitution only — do not pass multi-line values (sed
@@ -1625,7 +1648,7 @@ cmd_run_k8s() {
     info "Running DB bootstrap Job (schemas + world dump + migrations)..."
     render_template "${k8s_tpl}/db-init-job.yaml" \
         "NAMESPACE=${K8S_NAMESPACE}" "DB_PASS=${DB_PASS}" \
-        "REALM_ID=${REALM_ID}" "REALM_NAME=${REALM_NAME}" "REALM_ADDRESS=${REALM_ADDRESS}" \
+        "REALM_ID=${REALM_ID}" "REALM_NAME=$(_yaml_escape "$REALM_NAME")" "REALM_ADDRESS=$(_yaml_escape "$REALM_ADDRESS")" \
         "WORLD_PORT=${WORLD_PORT}" "CLIENT_BUILD=${CLIENT_BUILD}" \
         "SQL_HOSTPATH=${SOURCE_DIR}/sql" > "${manifest}.job"
     # shellcheck disable=SC2086
