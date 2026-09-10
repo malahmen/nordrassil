@@ -67,15 +67,30 @@ _require_sudo_or_instruct() {
     error_exit "Run it yourself, then re-run:
   $*"
 }
+# rpm-ostree layers packages into a new deployment that only takes effect
+# after a reboot, and every 'rpm-ostree install' is a separate (slow)
+# transaction — so on those hosts _ensure_pkg/_ensure_pkgs only queue what's
+# missing here, and cmd_install_deps layers the whole list in one go
+# (_layer_rpm_ostree_pending). Per-package installs used to 'return 1' after
+# the first one, which under set -e aborted install-deps right there.
+RPM_OSTREE_PENDING=()
+_layer_rpm_ostree_pending() {
+    [[ ${#RPM_OSTREE_PENDING[@]} -gt 0 ]] || return 0
+    local pkgs="${RPM_OSTREE_PENDING[*]}"
+    _require_sudo_or_instruct "Layering packages" "sudo rpm-ostree install -y --idempotent --allow-inactive ${pkgs} (then reboot)"
+    # --idempotent: already-layered packages aren't an error; --allow-inactive:
+    # nor are ones the base image already ships.
+    sudo rpm-ostree install -y --idempotent --allow-inactive "${RPM_OSTREE_PENDING[@]}" \
+        || error_exit "rpm-ostree install failed for: ${pkgs}"
+    warn "Layered via rpm-ostree: ${pkgs} — reboot, then re-run 'install-deps' to finish (ACE build)."
+}
 # _ensure_pkg <check-bin> <dnf-pkg> [apt-pkg]
 _ensure_pkg() {
     local bin="$1" dnf_pkg="$2" apt_pkg="${3:-$2}" pm
     command -v "$bin" &>/dev/null && { info "${bin} found."; return 0; }
     pm="$(_pkg_manager)"; [[ -n "$pm" ]] || error_exit "No supported package manager (dnf/apt/rpm-ostree) to install '${dnf_pkg}'."
     case "$pm" in
-        rpm-ostree) _require_sudo_or_instruct "Layering ${dnf_pkg}" "rpm-ostree install -y ${dnf_pkg} (then reboot)"
-                    rpm-ostree install -y "$dnf_pkg" || error_exit "rpm-ostree install failed for ${dnf_pkg}."
-                    warn "Layered via rpm-ostree — reboot before '${bin}' is available."; return 1 ;;
+        rpm-ostree) info "${bin} missing — queued for layering (${dnf_pkg})."; RPM_OSTREE_PENDING+=("$dnf_pkg"); return 0 ;;
         dnf)  _require_sudo_or_instruct "Installing ${dnf_pkg}" "sudo dnf install -y ${dnf_pkg}"; sudo dnf install -y "$dnf_pkg" || error_exit "dnf install failed for ${dnf_pkg}." ;;
         apt)  _require_sudo_or_instruct "Installing ${apt_pkg}" "sudo apt-get update -qq && sudo apt-get install -y ${apt_pkg}"; sudo apt-get update -qq && sudo apt-get install -y "$apt_pkg" || error_exit "apt install failed for ${apt_pkg}." ;;
     esac
@@ -88,7 +103,7 @@ _ensure_pkgs() {
     [[ -n "$pm" ]] || error_exit "No supported package manager (dnf/apt/rpm-ostree)."
     # shellcheck disable=SC2086
     case "$pm" in
-        rpm-ostree) _require_sudo_or_instruct "Layering packages" "rpm-ostree install -y ${dnf_pkgs}"; rpm-ostree install -y $dnf_pkgs || warn "Some packages may already be layered." ;;
+        rpm-ostree) info "Queued for layering: ${dnf_pkgs}"; local -a more; read -ra more <<<"$dnf_pkgs"; RPM_OSTREE_PENDING+=("${more[@]}"); return 0 ;;
         dnf)  _require_sudo_or_instruct "Installing packages" "sudo dnf install -y ${dnf_pkgs}"; sudo dnf install -y $dnf_pkgs || error_exit "dnf install failed." ;;
         apt)  _require_sudo_or_instruct "Installing packages" "sudo apt-get update -qq && sudo apt-get install -y ${apt_pkgs}"; sudo apt-get update -qq && sudo apt-get install -y $apt_pkgs || error_exit "apt install failed." ;;
     esac
@@ -346,12 +361,25 @@ cmd_install_deps() {
     header "nordrassil — Install dependencies"
 
     info "Build toolchain (for the local native path)..."
+    # git: _apply_source_patches (git apply); make: the cmake build and the
+    # ACE from-source build; unzip: _unpack_source; curl/tar: the ACE download.
     _ensure_pkg git    git    git
     _ensure_pkg cmake  cmake  cmake
     _ensure_pkg g++    gcc-c++ g++
-    _ensure_pkgs "tbb-devel mariadb-devel openssl-devel zlib-ng-compat-devel p7zip" \
-                 "libtbb-dev default-libmysqlclient-dev libssl-dev zlib1g-dev p7zip-full"
-    _ensure_ace || true
+    _ensure_pkg make   make   make
+    _ensure_pkg unzip  unzip  unzip
+    _ensure_pkg curl   curl   curl
+    _ensure_pkg tar    tar    tar
+    _ensure_pkgs "tbb-devel mariadb-devel openssl-devel zlib-ng-compat-devel" \
+                 "libtbb-dev default-libmysqlclient-dev libssl-dev zlib1g-dev"
+    _layer_rpm_ostree_pending
+    if [[ ${#RPM_OSTREE_PENDING[@]} -gt 0 ]]; then
+        # The toolchain just layered isn't usable until the reboot, so the
+        # ACE from-source build would only fail here — deferred to the re-run.
+        warn "Skipping the ACE check until after the reboot."
+    else
+        _ensure_ace || true
+    fi
 
     info "Docker (required for the DB container and the Docker/k8s deployment paths)..."
     _check_docker
