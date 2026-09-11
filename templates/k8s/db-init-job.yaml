@@ -36,30 +36,80 @@ spec:
           # order, then Custom content. Unlike 'configure', which applies
           # only the scripts named in CUSTOM_SQL, this Job applies every
           # sql/Custom/*.sql it finds (nothing renders a selection into it).
+          #
+          # Idempotent the same way 'configure' is, and through the same
+          # table: every import is recorded as a row in
+          # realmd.nordrassil_applied and skipped when the row is already
+          # there. run-k8s re-applies this Job on every deploy (the pod
+          # template is immutable, so it is deleted and recreated), and
+          # before this it blindly re-imported the whole world dump on top
+          # of a live database every time.
           command:
             - bash
             - -c
             - |
               set -euo pipefail
               mysql() { mariadb -h mariadb -uroot -p"${DB_PASS}" "$@"; }
+              # -N -B: no headers, no table borders — for reading one value.
+              mysql_raw() { mysql -N -B "$@"; }
+              # Same escaping as nordrassil.sh's _sql_escape: backslash
+              # first, then the single quote.
+              sql_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
+              applied() { [ -n "$(mysql_raw realmd -e "SELECT 1 FROM nordrassil_applied WHERE name='$(sql_escape "$1")' LIMIT 1;")" ]; }
+              mark()    { mysql realmd -e "INSERT IGNORE INTO nordrassil_applied (name) VALUES ('$(sql_escape "$1")');"; }
               until mariadb-admin ping -h mariadb -uroot -p"${DB_PASS}" --silent; do
                 echo "Waiting for mariadb..."; sleep 2
               done
               mysql -e "CREATE DATABASE IF NOT EXISTS realmd; CREATE DATABASE IF NOT EXISTS mangos; CREATE DATABASE IF NOT EXISTS characters; CREATE DATABASE IF NOT EXISTS logs;"
-              mysql realmd     < /sql/Base/logon.sql
-              mysql mangos     < /sql/Base/world.sql
-              mysql characters < /sql/Base/characters.sql
-              mysql logs       < /sql/Base/logs.sql
+
+              # Whether the bookkeeping table already existed has to be known
+              # before creating it: absent, on a database that already has
+              # realmd.account, means this Job ran at least once before the
+              # table existed — everything mounted at /sql was imported by
+              # that run, so record it instead of importing it again.
+              had_tracking=1
+              [ -n "$(mysql_raw -e "SHOW TABLES FROM realmd LIKE 'nordrassil_applied';")" ] || had_tracking=0
+              mysql -e "CREATE TABLE IF NOT EXISTS realmd.nordrassil_applied (name VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
+              if [ "$had_tracking" = "0" ] && [ -n "$(mysql_raw -e "SHOW TABLES FROM realmd LIKE 'account';")" ]; then
+                echo "Existing bootstrapped database without import state — recording what is already imported."
+                mark base
+                [ -d /sql/Anticheat ] && mark anticheat
+                mark world-full
+                for f in /sql/Migrations/[0-9]*.sql; do
+                  [ -e "$f" ] || continue
+                  mark "migration:$(basename "$f")"
+                done
+                for f in /sql/Custom/*.sql; do
+                  [ -e "$f" ] || continue
+                  mark "custom:$(basename "$f")"
+                done
+              fi
+
+              if applied base; then
+                echo "Base schemas already imported — skipping."
+              else
+                mysql realmd     < /sql/Base/logon.sql
+                mysql mangos     < /sql/Base/world.sql
+                mysql characters < /sql/Base/characters.sql
+                mysql logs       < /sql/Base/logs.sql
+                mark base
+              fi
               # Required, not optional: mangosd hard-crashes at startup if
               # these tables (e.g. realmd.antispam_blacklist) don't exist —
               # the Anticheat/Warden/antispam features are always compiled in.
-              if [ -d /sql/Anticheat ]; then
+              if [ -d /sql/Anticheat ] && ! applied anticheat; then
                 mysql realmd     < /sql/Anticheat/realmd.sql
                 mysql mangos     < /sql/Anticheat/world.sql
                 mysql characters < /sql/Anticheat/characters.sql
+                mark anticheat
               fi
-              echo "Importing world dump (this takes a while)..."
-              mysql mangos < /sql/world_full_14_june_2021.sql
+              if applied world-full; then
+                echo "World dump already imported — skipping."
+              else
+                echo "Importing world dump (this takes a while)..."
+                mysql mangos < /sql/world_full_14_june_2021.sql
+                mark world-full
+              fi
               # Migrations/ holds files for all 4 databases (suffix-routed),
               # plus 4 pre-merged "*_db_updates.sql" aggregates and
               # merge.bat/merge.sh/README with no numeric prefix — applying
@@ -67,6 +117,8 @@ spec:
               # the same changes, so only numerically-prefixed files are used.
               for f in /sql/Migrations/[0-9]*.sql; do
                 [ -e "$f" ] || continue
+                name="migration:$(basename "$f")"
+                if applied "$name"; then continue; fi
                 case "$f" in
                   *_world.sql)      db=mangos ;;
                   *_characters.sql) db=characters ;;
@@ -76,20 +128,21 @@ spec:
                 esac
                 echo "Applying migration: $f -> ${db}"
                 mysql "$db" < "$f"
+                mark "$name"
               done
               for f in /sql/Custom/*.sql; do
                 [ -e "$f" ] || continue
+                name="custom:$(basename "$f")"
+                if applied "$name"; then continue; fi
                 echo "Applying custom content: $f"
-                mysql mangos < "$f" || echo "  (failed, continuing) $f"
+                if mysql mangos < "$f"; then mark "$name"; else echo "  (failed, continuing) $f"; fi
               done
               # None of the SQL dumps seed realmlist — it's inherently
               # deployment-specific (the realm's actual reachable
-              # address/port). Without it mangosd refuses to start.
+              # address/port). Without it mangosd refuses to start. Not
+              # tracked in nordrassil_applied: it's an upsert that must keep
+              # following the current REALM_ADDRESS on every deploy.
               echo "Ensuring realmlist row..."
-              # REALM_NAME/REALM_ADDRESS are operator free text — escape them
-              # for the single-quoted SQL literals (same as nordrassil.sh's
-              # _sql_escape: backslash first, then the quote).
-              sql_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
               realm_name_sql="$(sql_escape "${REALM_NAME}")"
               realm_addr_sql="$(sql_escape "${REALM_ADDRESS}")"
               mysql realmd -e "INSERT INTO realmlist (id, name, address, localAddress, localSubnetMask, port, gamebuild_min, gamebuild_max)
