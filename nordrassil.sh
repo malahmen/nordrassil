@@ -414,16 +414,28 @@ cmd_install_deps() {
 # DB bootstrap — shared by 'configure' (local) and the k8s db-init Job
 # -----------------------------------------------------------------------------
 
+# The mariadb client reads its password from MYSQL_PWD when no -p is given,
+# and 'docker exec -e NAME' (no '=value') forwards the variable from this
+# process's own environment — so the password reaches the client without ever
+# appearing in an argument vector. '-p"$DB_PASS"' put it in the docker CLI's
+# argv, i.e. in every 'ps' on this host, for any user, for the whole
+# (multi-minute, during a world-dump import) lifetime of the call.
+#
+# What remains: the value is in this script's and the docker CLI's
+# environment, readable through /proc/<pid>/environ by the same user and by
+# root — not by everyone, and not by a casual 'ps'. Removing that too would
+# mean not handing the password to a client process at all.
+
 _db_exec() {
     # _db_exec <sql>
-    docker exec "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -p"$DB_PASS" -e "$1"
+    MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -e "$1"
 }
 
 _db_import() {
     # _db_import <database> <file>
     local db="$1" file="$2"
     [[ -f "$file" ]] || { warn "Missing SQL file, skipping: ${file}"; return 0; }
-    docker exec -i "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -p"$DB_PASS" "$db" < "$file"
+    MYSQL_PWD="$DB_PASS" docker exec -i -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" "$db" < "$file"
 }
 
 _ensure_local_mariadb() {
@@ -431,9 +443,11 @@ _ensure_local_mariadb() {
         docker start "$DB_CONTAINER_NAME" &>/dev/null || true
     else
         info "Starting local MariaDB container '${DB_CONTAINER_NAME}'..."
-        docker run -d \
+        # -e NAME (no '=value'): the password comes from this process's
+        # environment instead of the docker CLI's argv — see _db_exec.
+        MARIADB_ROOT_PASSWORD="$DB_PASS" docker run -d \
             --name "$DB_CONTAINER_NAME" \
-            -e MARIADB_ROOT_PASSWORD="$DB_PASS" \
+            -e MARIADB_ROOT_PASSWORD \
             -p "127.0.0.1:${DB_PORT}:3306" \
             -v "${DB_VOLUME}:/var/lib/mysql" \
             --restart unless-stopped \
@@ -443,7 +457,7 @@ _ensure_local_mariadb() {
 
     info "Waiting for MariaDB to accept connections..."
     local attempts=0
-    until docker exec "$DB_CONTAINER_NAME" mariadb-admin ping -u"$DB_USER" -p"$DB_PASS" --silent &>/dev/null; do
+    until MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb-admin ping -u"$DB_USER" --silent &>/dev/null; do
         attempts=$((attempts + 1))
         [[ $attempts -ge 40 ]] && error_exit "Timed out waiting for MariaDB. Check: docker logs ${DB_CONTAINER_NAME}"
         sleep 1
@@ -463,7 +477,10 @@ _db_bootstrap() {
     if [[ ! -f "${MIGRATIONS_MARKER_DIR}/.base-imported" ]]; then
         info "Importing base schemas (sql/Base/*.sql)..."
         info "Importing sql/Base/logon.sql -> realmd..."
-            bash -c "_db_import() { docker exec -i '${DB_CONTAINER_NAME}' mariadb -u'${DB_USER}' -p'${DB_PASS}' \"\$1\" < \"\$2\"; }; _db_import realmd '${sql_dir}/Base/logon.sql'" \
+        # Was an inline 'bash -c' that redefined _db_import with the password
+        # spliced into the child shell's own command line — the same argv
+        # exposure, twice over. The real _db_import does exactly this.
+        _db_import realmd "${sql_dir}/Base/logon.sql" \
             || error_exit "Failed to import Base/logon.sql"
         _db_import mangos     "${sql_dir}/Base/world.sql"
         _db_import characters "${sql_dir}/Base/characters.sql"
@@ -495,7 +512,9 @@ _db_bootstrap() {
         [[ -f "$dump" ]] || error_exit "World dump not found: ${dump}"
         warn "Importing the full world dump (~250MB) — this can take several minutes."
         info "Importing world_full_14_june_2021.sql..."
-            docker exec -i "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -p"$DB_PASS" mangos < "$dump" \
+        # The file's existence is checked above, so _db_import's skip-if-missing
+        # path can't swallow anything here.
+        _db_import mangos "$dump" \
             || error_exit "Failed to import world_full_14_june_2021.sql"
         touch "${MIGRATIONS_MARKER_DIR}/.world-full-imported"
         success "World dump imported."
@@ -1035,6 +1054,29 @@ _detect_db_target() {
 # (backslash first, so it isn't double-escaped by the quote pass after it).
 _sql_escape() { printf '%s' "$1" | sed -e "s/\\\\/\\\\\\\\/g" -e "s/'/\\\\'/g"; }
 
+# _kube_mariadb <mariadb args...> — runs the mariadb client in the cluster's
+# MariaDB pod. 'kubectl exec' has no --env of its own, so the password is
+# piped in on stdin and exported inside the pod instead: passing it as an
+# argument would put it right back in this host's 'ps' output (see the note
+# above _db_exec). None of the callers need stdin for anything else.
+_kube_mariadb() {
+    local ctx_flags pod
+    ctx_flags="$(kubectl_context_flag)"
+    # '|| pod=""': a failing kubectl must reach the warn below instead of
+    # ending the script silently under set -e (stderr is muted).
+    # shellcheck disable=SC2086
+    pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || pod=""
+    if [[ -z "$pod" ]]; then
+        warn "No running vanilla-wow-mariadb pod found in namespace ${K8S_NAMESPACE}."
+        return 1
+    fi
+    # sh -c '<script>' _ mariadb <args>: '_' becomes $0, so "$@" inside the
+    # script is exactly the command to run.
+    # shellcheck disable=SC2086
+    printf '%s' "$DB_PASS" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- \
+        sh -c 'MYSQL_PWD="$(cat)"; export MYSQL_PWD; exec "$@"' _ mariadb "$@"
+}
+
 # _db_query <target: local|docker|k8s> <sql> — local/docker share the same
 # local MariaDB container (_db_exec); k8s has its own separate MariaDB pod
 # in the cluster (see the architecture note on templates/k8s/mariadb.yaml),
@@ -1046,17 +1088,10 @@ _db_query() {
             # -t (table format), not _db_exec's plain tab-separated output —
             # every _db_query caller is a human-facing read, not the DB
             # bootstrap machinery _db_exec also serves.
-            docker exec "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -p"$DB_PASS" -t -e "$sql"
+            MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -t -e "$sql"
             ;;
         k8s)
-            local ctx_flags pod
-            ctx_flags="$(kubectl_context_flag)"
-            pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-            if [[ -z "$pod" ]]; then
-                warn "No running vanilla-wow-mariadb pod found in namespace ${K8S_NAMESPACE}."
-                return 1
-            fi
-            kubectl $ctx_flags exec -n "$K8S_NAMESPACE" "$pod" -- mariadb -u"$DB_USER" -p"$DB_PASS" -t -e "$sql"
+            _kube_mariadb -u"$DB_USER" -t -e "$sql"
             ;;
     esac
 }
@@ -1068,17 +1103,10 @@ _db_query_raw() {
     local tgt="$1" sql="$2"
     case "$tgt" in
         local|docker)
-            docker exec "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -p"$DB_PASS" -N -B -e "$sql"
+            MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -N -B -e "$sql"
             ;;
         k8s)
-            local ctx_flags pod
-            ctx_flags="$(kubectl_context_flag)"
-            pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-            if [[ -z "$pod" ]]; then
-                warn "No running vanilla-wow-mariadb pod found in namespace ${K8S_NAMESPACE}."
-                return 1
-            fi
-            kubectl $ctx_flags exec -n "$K8S_NAMESPACE" "$pod" -- mariadb -u"$DB_USER" -p"$DB_PASS" -N -B -e "$sql"
+            _kube_mariadb -u"$DB_USER" -N -B -e "$sql"
             ;;
     esac
 }
