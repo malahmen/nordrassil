@@ -158,10 +158,13 @@ INSTALL_DIR="${CONFIG_DIR}/install"
 SRC_UNPACK_DIR="${CONFIG_DIR}/src"
 ETC_DIR="${CONFIG_DIR}/etc"
 PF_DIR="${CONFIG_DIR}/pf"
+# Legacy host-side import markers. Nothing writes here any more (import
+# state lives in realmd.nordrassil_applied, see _db_bootstrap); the path is
+# still read once, to seed that table on an already-bootstrapped deployment.
 MIGRATIONS_MARKER_DIR="${CONFIG_DIR}/applied-migrations"
 IMAGE_BUILD_CONTEXT="${CONFIG_DIR}/image-build-context"
 
-mkdir -p "$CONFIG_DIR" "$ETC_DIR" "$PF_DIR" "$MIGRATIONS_MARKER_DIR"
+mkdir -p "$CONFIG_DIR" "$ETC_DIR" "$PF_DIR"
 
 CLIENT_BUILD_DEFAULT=5875
 # Pinned release for the from-source ACE build (dnf/rpm-ostree hosts — no
@@ -451,8 +454,88 @@ _ensure_local_mariadb() {
     success "MariaDB ready."
 }
 
+# -----------------------------------------------------------------------------
+# Import bookkeeping — realmd.nordrassil_applied
+#
+# Which dumps/migrations have been imported is a property OF THE DATABASE, so
+# that is where it is recorded: one row per applied item in
+# realmd.nordrassil_applied. It used to be host-side marker files under
+# CONFIG_DIR/applied-migrations, which silently lied whenever the two drifted
+# apart — rename or recreate the MariaDB container (or its volume) and every
+# import still looked "already done" against an empty database, leaving
+# mangosd unable to start against schemas that were never created.
+#
+# Row names: "base", "anticheat", "world-full", "migration:<file>.sql",
+# "custom:<file>.sql". Every name goes through _sql_escape, like every other
+# string literal this script sends.
+#
+# All three helpers talk to the local MariaDB container (_db_exec/_db_query_raw
+# with the "docker" target — local and docker share that one container); the
+# k8s deployment keeps the same table, written by its own db-init Job.
+# -----------------------------------------------------------------------------
+
+# _db_table_exists <database> <table>
+_db_table_exists() {
+    local out
+    out="$(_db_query_raw docker "SHOW TABLES FROM ${1} LIKE '$(_sql_escape "$2")';" 2>/dev/null)" || out=""
+    [[ -n "$out" ]]
+}
+
+# _db_is_applied <name>
+_db_is_applied() {
+    local out
+    out="$(_db_query_raw docker "SELECT 1 FROM realmd.nordrassil_applied WHERE name='$(_sql_escape "$1")' LIMIT 1;" 2>/dev/null)" || out=""
+    [[ -n "$out" ]]
+}
+
+# _db_mark_applied <name> — INSERT IGNORE so a re-run after a partial failure
+# doesn't error out on the primary key.
+_db_mark_applied() {
+    _db_exec "INSERT IGNORE INTO realmd.nordrassil_applied (name) VALUES ('$(_sql_escape "$1")');" >/dev/null \
+        || warn "Could not record '${1}' as applied — it will be imported again on the next run."
+}
+
+# _db_seed_applied_from_markers — one-time transition for deployments
+# bootstrapped by the marker-file version of this script: the tracking table
+# is brand new but realmd.account is already there, so the database really is
+# populated and re-importing would be destructive. Translate whatever markers
+# the host still has into rows. Without markers nothing can be seeded (the
+# imports then re-run, as they would have before this table existed) — say so
+# rather than failing silently.
+_db_seed_applied_from_markers() {
+    if ! _db_table_exists realmd account; then
+        return 0  # genuinely empty database — a normal first bootstrap.
+    fi
+    if [[ ! -d "$MIGRATIONS_MARKER_DIR" ]]; then
+        warn "The database looks bootstrapped but no import state was found (no tracking table, no ${MIGRATIONS_MARKER_DIR}) — imports below will run again."
+        return 0
+    fi
+    local marker name seeded=0
+    # The three top-level markers are dotfiles, so they need naming, not a glob.
+    local -a legacy=(".base-imported:base" ".anticheat-imported:anticheat" ".world-full-imported:world-full")
+    local pair
+    for pair in "${legacy[@]}"; do
+        [[ -f "${MIGRATIONS_MARKER_DIR}/${pair%%:*}" ]] || continue
+        _db_mark_applied "${pair#*:}"; seeded=$((seeded + 1))
+    done
+    for marker in "${MIGRATIONS_MARKER_DIR}"/*.done; do
+        [[ -e "$marker" ]] || continue          # nullglob is not set here
+        name="$(basename "$marker" .done)"
+        case "$name" in
+            custom-*) _db_mark_applied "custom:${name#custom-}" ;;
+            *)        _db_mark_applied "migration:${name}" ;;
+        esac
+        seeded=$((seeded + 1))
+    done
+    [[ $seeded -gt 0 ]] \
+        && info "Migrated ${seeded} host-side import marker(s) into realmd.nordrassil_applied (${MIGRATIONS_MARKER_DIR} is no longer used)." \
+        || warn "The database looks bootstrapped but no import markers were found — imports below will run again."
+    return 0
+}
+
 # _db_bootstrap — creates schemas, imports Base + world dump + Migrations
-# (idempotent via marker files), optionally applies sql/Custom/*.sql.
+# (idempotent via the realmd.nordrassil_applied table), optionally applies
+# sql/Custom/*.sql.
 _db_bootstrap() {
     local sql_dir="${SOURCE_DIR}/sql"
     [[ -d "$sql_dir" ]] || error_exit "sql/ directory not found under SOURCE_DIR: ${sql_dir}"
@@ -460,7 +543,17 @@ _db_bootstrap() {
     info "Creating databases (realmd, mangos, characters, logs) if missing..."
     _db_exec "CREATE DATABASE IF NOT EXISTS realmd; CREATE DATABASE IF NOT EXISTS mangos; CREATE DATABASE IF NOT EXISTS characters; CREATE DATABASE IF NOT EXISTS logs;"
 
-    if [[ ! -f "${MIGRATIONS_MARKER_DIR}/.base-imported" ]]; then
+    # Import bookkeeping table (see the block above _db_bootstrap). Whether it
+    # already existed has to be known BEFORE creating it: its absence on an
+    # otherwise-populated database is exactly the upgrade case that needs the
+    # old host-side markers translated into rows.
+    local had_tracking=0
+    _db_table_exists realmd nordrassil_applied && had_tracking=1
+    _db_exec "CREATE TABLE IF NOT EXISTS realmd.nordrassil_applied (name VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);" \
+        || error_exit "Failed to create realmd.nordrassil_applied (the import bookkeeping table)."
+    [[ $had_tracking -eq 1 ]] || _db_seed_applied_from_markers
+
+    if ! _db_is_applied base; then
         info "Importing base schemas (sql/Base/*.sql)..."
         info "Importing sql/Base/logon.sql -> realmd..."
             bash -c "_db_import() { docker exec -i '${DB_CONTAINER_NAME}' mariadb -u'${DB_USER}' -p'${DB_PASS}' \"\$1\" < \"\$2\"; }; _db_import realmd '${sql_dir}/Base/logon.sql'" \
@@ -468,10 +561,10 @@ _db_bootstrap() {
         _db_import mangos     "${sql_dir}/Base/world.sql"
         _db_import characters "${sql_dir}/Base/characters.sql"
         _db_import logs       "${sql_dir}/Base/logs.sql"
-        touch "${MIGRATIONS_MARKER_DIR}/.base-imported"
+        _db_mark_applied base
         success "Base schemas imported."
     else
-        info "Base schemas already imported (marker present) — skipping."
+        info "Base schemas already imported (recorded in the database) — skipping."
     fi
 
     # sql/Anticheat/*.sql — despite living next to the optional Custom/
@@ -479,28 +572,28 @@ _db_bootstrap() {
     # features are always compiled in and mangosd hard-crashes at startup
     # (uncaught C++ exception) if e.g. realmd.antispam_blacklist doesn't
     # exist. Same per-database file naming as Base/.
-    if [[ -d "${sql_dir}/Anticheat" ]] && [[ ! -f "${MIGRATIONS_MARKER_DIR}/.anticheat-imported" ]]; then
+    if [[ -d "${sql_dir}/Anticheat" ]] && ! _db_is_applied anticheat; then
         info "Importing anticheat schemas (sql/Anticheat/*.sql) — required, not optional..."
         _db_import realmd     "${sql_dir}/Anticheat/realmd.sql"
         _db_import mangos     "${sql_dir}/Anticheat/world.sql"
         _db_import characters "${sql_dir}/Anticheat/characters.sql"
-        touch "${MIGRATIONS_MARKER_DIR}/.anticheat-imported"
+        _db_mark_applied anticheat
         success "Anticheat schemas imported."
     else
-        info "Anticheat schemas already imported (marker present) — skipping."
+        info "Anticheat schemas already imported (recorded in the database) — skipping."
     fi
 
-    if [[ ! -f "${MIGRATIONS_MARKER_DIR}/.world-full-imported" ]]; then
+    if ! _db_is_applied world-full; then
         local dump="${sql_dir}/world_full_14_june_2021.sql"
         [[ -f "$dump" ]] || error_exit "World dump not found: ${dump}"
         warn "Importing the full world dump (~250MB) — this can take several minutes."
         info "Importing world_full_14_june_2021.sql..."
             docker exec -i "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -p"$DB_PASS" mangos < "$dump" \
             || error_exit "Failed to import world_full_14_june_2021.sql"
-        touch "${MIGRATIONS_MARKER_DIR}/.world-full-imported"
+        _db_mark_applied world-full
         success "World dump imported."
     else
-        info "World dump already imported (marker present) — skipping."
+        info "World dump already imported (recorded in the database) — skipping."
     fi
 
     # Migrations/ holds per-migration files for all 4 databases, distinguished
@@ -516,7 +609,7 @@ _db_bootstrap() {
     while IFS= read -r mfile; do
         [[ -z "$mfile" ]] && continue
         mname="$(basename "$mfile")"
-        if [[ -f "${MIGRATIONS_MARKER_DIR}/${mname}.done" ]]; then
+        if _db_is_applied "migration:${mname}"; then
             skipped=$((skipped + 1))
             continue
         fi
@@ -528,7 +621,7 @@ _db_bootstrap() {
             *) warn "Skipping migration with unrecognized suffix: ${mname}"; continue ;;
         esac
         _db_import "$target_db" "$mfile" || error_exit "Migration failed: ${mname} (target db: ${target_db})"
-        touch "${MIGRATIONS_MARKER_DIR}/${mname}.done"
+        _db_mark_applied "migration:${mname}"
         applied=$((applied + 1))
     done < <(find "${sql_dir}/Migrations" -maxdepth 1 -name "[0-9]*.sql" 2>/dev/null | sort)
     info "Migrations: ${applied} applied, ${skipped} already up to date."
@@ -550,7 +643,7 @@ _db_bootstrap() {
     # The engine applies exactly the scripts named in CUSTOM_SQL (comma- or
     # space-separated basenames, without .sql) — the front-end shows the operator
     # the available list (see 'list-custom') and sets this. Anything not listed is
-    # skipped; files already applied (marker present) are never re-applied.
+    # skipped; files already applied (recorded in the DB) are never re-applied.
     if [[ -d "${sql_dir}/Custom" && -n "${CUSTOM_SQL:-}" ]]; then
         local want cfile applied_custom=0
         local wanted="${CUSTOM_SQL//,/ }"
@@ -558,9 +651,9 @@ _db_bootstrap() {
             want="${want%.sql}"
             cfile="${sql_dir}/Custom/${want}.sql"
             [[ -f "$cfile" ]] || { warn "Custom script not found, skipping: ${want}.sql"; continue; }
-            [[ -f "${MIGRATIONS_MARKER_DIR}/custom-${want}.sql.done" ]] && { info "Custom already applied: ${want}.sql"; continue; }
+            _db_is_applied "custom:${want}.sql" && { info "Custom already applied: ${want}.sql"; continue; }
             _db_import mangos "$cfile" || warn "Custom script failed (continuing): ${want}.sql"
-            touch "${MIGRATIONS_MARKER_DIR}/custom-${want}.sql.done"
+            _db_mark_applied "custom:${want}.sql"
             info "Applied: ${want}.sql"; applied_custom=$((applied_custom + 1))
         done
         [[ $applied_custom -gt 0 ]] && success "Custom content applied (${applied_custom})."
