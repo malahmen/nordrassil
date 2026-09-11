@@ -942,6 +942,43 @@ _build_native() {
     success "Built and installed to ${INSTALL_DIR}."
 }
 
+# mangosd/realmd both run an interactive console reader on stdin. A
+# backgrounded process inherits this shell's stdin, which under a
+# nohup/non-interactive invocation delivers an immediate EOF — the console
+# reads that as an implicit quit, so the server fully starts and then shuts
+# itself down seconds later. Each one therefore gets its own FIFO with a
+# small detached 'sleep infinity' holding the write end open, so stdin never
+# reaches EOF for as long as the server is meant to run (the container path
+# hits the same issue — solved there with 'docker run -i' / pod stdin: true).
+# mangosd's FIFO doubles as its console channel (create-account & friends
+# write to it); realmd's exists purely to hold stdin open.
+#
+# The holder PID is recorded so 'stop' can kill it. It used to be an
+# anonymous '< <(sleep infinity)' process substitution for realmd, which
+# nothing tracked and nothing ever killed: every 'start' left another
+# orphaned 'sleep infinity' behind, surviving 'stop' and the shell itself.
+#
+# _start_stdin_holder <fifo> <holder-pidfile>
+_start_stdin_holder() {
+    local fifo="$1" holder_pf="$2"
+    rm -f "$fifo"
+    mkfifo "$fifo" || error_exit "Could not create the stdin FIFO: ${fifo}"
+    # exec 9<>fifo: open both ends (never blocks, never sees EOF), then
+    # become 'sleep infinity' so $! is the PID that actually holds it open.
+    ( exec 9<>"$fifo"; exec sleep infinity ) &
+    echo "$!" > "$holder_pf"
+}
+
+# _stop_stdin_holder <fifo> <holder-pidfile>
+_stop_stdin_holder() {
+    local fifo="$1" holder_pf="$2"
+    if [[ -f "$holder_pf" ]]; then
+        kill "$(cat "$holder_pf")" 2>/dev/null || true
+        rm -f "$holder_pf"
+    fi
+    rm -f "$fifo"
+}
+
 cmd_start() {
     header "nordrassil — Start (local)"
     _settings
@@ -966,19 +1003,14 @@ cmd_start() {
     cp -f "${ETC_DIR}/realmd.conf"  "${INSTALL_DIR}/etc/realmd.conf"
 
     local realmd_pf="${PF_DIR}/realmd.pid" mangosd_pf="${PF_DIR}/mangosd.pid"
+    local realmd_fifo="${INSTALL_DIR}/bin/realmd.stdin" mangosd_fifo="${INSTALL_DIR}/bin/mangosd.stdin"
 
-    # < <(sleep infinity): mangosd/realmd run an interactive console reader
-    # on stdin. A backgrounded process normally inherits this shell's stdin,
-    # which under nohup/non-interactive invocation delivers an immediate
-    # EOF — the console reads that as an implicit quit, so the server fully
-    # starts and then shuts itself down seconds later. Feeding stdin from a
-    # process substitution that never writes and never exits keeps it open
-    # without ever producing EOF (the container path hits the same issue —
-    # fixed there with 'docker run -i' / pod stdin: true).
+    # Both servers get a tracked FIFO + holder — see _start_stdin_holder.
     if pf_is_running "$realmd_pf"; then
         warn "realmd already running (pid file present)."
     else
-        (cd "${INSTALL_DIR}/bin" && nohup ./realmd >> "${INSTALL_DIR}/logs/realmd.out" 2>&1 < <(sleep infinity) &
+        _start_stdin_holder "$realmd_fifo" "${PF_DIR}/realmd-stdin-holder.pid"
+        (cd "${INSTALL_DIR}/bin" && nohup ./realmd >> "${INSTALL_DIR}/logs/realmd.out" 2>&1 < "$realmd_fifo" &
          echo "$!:${REALM_PORT}" > "$realmd_pf")
         sleep 1
         pf_is_running "$realmd_pf" && success "realmd started (port ${REALM_PORT})." || warn "realmd did not start — check ${INSTALL_DIR}/logs/realmd.out"
@@ -987,21 +1019,13 @@ cmd_start() {
     if pf_is_running "$mangosd_pf"; then
         warn "mangosd already running (pid file present)."
     else
-        # mangosd gets a real FIFO instead of the sleep-infinity trick, so
-        # 'create-account' can still reach its console. Unlike the container
-        # path (where entrypoint.sh's own long-lived PID 1 process holds the
-        # FIFO's write end open for free), this command returns immediately
-        # after backgrounding mangosd, so nothing would otherwise keep a
-        # writer attached — the FIFO would report EOF to mangosd on its next
-        # read and trigger the same implicit-quit bug this whole thing exists
-        # to avoid. A small detached 'sleep infinity' holds fd 9 open on the
-        # FIFO for as long as mangosd itself is meant to run; 'stop' kills it
-        # alongside mangosd.
-        local mangosd_fifo="${INSTALL_DIR}/bin/mangosd.stdin"
-        rm -f "$mangosd_fifo"
-        mkfifo "$mangosd_fifo"
-        ( exec 9<>"$mangosd_fifo"; exec sleep infinity ) &
-        echo "$!" > "${PF_DIR}/mangosd-stdin-holder.pid"
+        # mangosd's FIFO is also its console channel: 'create-account' &
+        # friends write command lines into it (see _send_console_cmd).
+        # Unlike the container path (where entrypoint.sh's own long-lived
+        # PID 1 holds the write end open for free), this command returns
+        # right after backgrounding mangosd, so without the holder the FIFO
+        # would report EOF on mangosd's next read.
+        _start_stdin_holder "$mangosd_fifo" "${PF_DIR}/mangosd-stdin-holder.pid"
 
         (cd "${INSTALL_DIR}/bin" && nohup ./mangosd >> "${INSTALL_DIR}/logs/mangosd.out" 2>&1 < "$mangosd_fifo" &
          echo "$!:${WORLD_PORT}" > "$mangosd_pf")
@@ -1017,18 +1041,16 @@ cmd_stop() {
     _settings
 
     local realmd_pf="${PF_DIR}/realmd.pid" mangosd_pf="${PF_DIR}/mangosd.pid"
-    local holder_pf="${PF_DIR}/mangosd-stdin-holder.pid"
 
     if pf_is_running "$mangosd_pf"; then pf_stop "$mangosd_pf"; else info "mangosd not running."; fi
     if pf_is_running "$realmd_pf";  then pf_stop "$realmd_pf";  else info "realmd not running.";  fi
 
-    # Companion 'sleep infinity' that kept mangosd's console FIFO writable
-    # (see 'start') — no longer needed once mangosd itself is stopped.
-    if [[ -f "$holder_pf" ]]; then
-        kill "$(cat "$holder_pf")" 2>/dev/null || true
-        rm -f "$holder_pf"
-    fi
-    rm -f "${INSTALL_DIR}/bin/mangosd.stdin"
+    # The companion 'sleep infinity' holders that kept each server's stdin
+    # FIFO open (see 'start') — both are killed here, and both FIFOs removed,
+    # once the servers themselves are stopped. realmd's used to be an
+    # untracked process substitution that 'stop' had no way to reach.
+    _stop_stdin_holder "${INSTALL_DIR}/bin/mangosd.stdin" "${PF_DIR}/mangosd-stdin-holder.pid"
+    _stop_stdin_holder "${INSTALL_DIR}/bin/realmd.stdin"  "${PF_DIR}/realmd-stdin-holder.pid"
 }
 
 cmd_status() {
