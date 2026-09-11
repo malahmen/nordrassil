@@ -226,6 +226,21 @@ _detect_lan_ip() {
     ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo "127.0.0.1"
 }
 
+# Every key _settings resolves below, in the same order — the allowlist
+# 'get' answers from (see cmd_get). Keep the two in step: a setting missing
+# here is still settable and still used, it just can't be read back with its
+# default, which is how the front-end pre-fills its prompts.
+SETTING_KEYS=(
+    SOURCE_DIR CLIENT_BUILD
+    DB_HOST DB_PORT DB_USER DB_PASS DB_CONTAINER_NAME DB_VOLUME
+    REALM_ID REALM_PORT WORLD_PORT REALM_ADDRESS REALM_NAME REALM_ZONE
+    GAME_TYPE PLAYER_LIMIT WOW_PATCH MOTD XP_RATE DROP_RATE
+    WRONG_PASS_MAX_COUNT WRONG_PASS_BAN_TIME WRONG_PASS_BAN_TYPE
+    REQ_EMAIL_VERIFICATION STRICT_VERSION_CHECK WARDEN_ENABLED STRICT_PLAYER_NAMES
+    IMAGE_TAG SERVER_CONTAINER_NAME K8S_NAMESPACE CUSTOM_SQL
+    K8S_STORAGE_TYPE K8S_DATA_HOSTPATH K8S_DB_HOSTPATH K8S_STORAGECLASS
+)
+
 _settings() {
     # Paths the front-end may hand over with a literal leading '~' (a quoted
     # 'set SOURCE_DIR ~/x' never reaches the shell's own tilde expansion) —
@@ -1822,15 +1837,27 @@ cmd_get() {
     _settings
     [[ $# -eq 1 ]] || error_exit "get: usage: get KEY"
     # Return the EFFECTIVE value: for a known setting _settings has already
-    # resolved it (config value or its default), so echo that global; for any
-    # other key fall back to the raw config store. This lets the front-end
-    # pre-fill its prompts with real defaults, not blanks.
-    local key="$1"
-    if declare -p "$key" &>/dev/null; then
+    # resolved it (config value or its default), so echo that global; for a
+    # key that is only in the config store, echo what is stored. This lets the
+    # front-end pre-fill its prompts with real defaults, not blanks.
+    #
+    # Scope matters here: the test used to be 'declare -p "$key"', i.e. "is
+    # there a shell variable by that name", so 'get PATH', 'get HOME' or
+    # 'get BASH_VERSINFO' happily printed this shell's own state — and a key
+    # colliding with an internal (CONFIG_FILE, DB_CONTAINER_NAME's neighbours,
+    # PF_DIR...) would answer from the script instead of the config. The
+    # config store is the only thing this command speaks for.
+    local key="$1" k
+    # The key is spliced into a regex below — same rule as cfg_set's.
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || error_exit "get: invalid key '${key}' (letters, digits, underscore)."
+    for k in "${SETTING_KEYS[@]}"; do
+        [[ "$k" == "$key" ]] || continue
         printf '%s\n' "${!key}"
-    else
-        cfg_get "$key"
-    fi
+        return 0
+    done
+    grep -qE "^${key}=" "$CONFIG_FILE" 2>/dev/null \
+        || error_exit "get: unknown key '${key}' — not a nordrassil setting and not in ${CONFIG_FILE} ('config' dumps what is stored)."
+    cfg_get "$key"
 }
 
 # Dumps the whole persisted config (key="value" per line) — the front-end reads
