@@ -38,6 +38,16 @@ the server image, never installed natively on the host. The same bootstrap
 sequence (schemas + world dump + migrations + optional `sql/Custom` content) is
 reused by `configure` (local dev) and the k8s `db-init` Job.
 
+Import state is tracked **inside the database**, in `realmd.nordrassil_applied`,
+so what has been imported travels with the data rather than with this host. Each
+step records a row (`base`, `anticheat`, `world-full`, `migration:<file>.sql`,
+`custom:<file>.sql`) and is skipped on a later run. Recreating the container or
+volume therefore re-imports correctly, where the earlier host-side marker files
+would have claimed everything was already done against an empty database. An
+existing install is migrated once, automatically, by seeding the table from those
+old markers; a populated database with neither the table nor markers re-imports
+and says so.
+
 > **Platform:** the server is Linux + Docker + Kubernetes, and the script needs
 > bash 4+ (macOS ships 3.2 — `brew install bash`). From macOS only the config
 > store (`set`/`get`/`config`) and, against a remote kube context, the k8s
