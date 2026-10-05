@@ -269,6 +269,29 @@ in `$XDG_RUNTIME_DIR` — tmpfs, mode `0600`, gone on logout — so it is never
 written to a persistent file; with no `$XDG_RUNTIME_DIR` it simply prompts
 every time. `forget` clears it.
 
+### Servers this tool does not own
+
+`MANAGED_EXTERNALLY=1` marks a profile as describing a server that something
+else provisions — Ansible, a GitOps controller, a CI pipeline. The commands
+that create, destroy or re-bootstrap a server are then refused:
+
+> `configure`, `build-image`, `run-docker`, `stop-docker`, `run-k8s`,
+> `stop-k8s`, `start`, `stop`, `edit`
+
+Everything that *administers* one still works: accounts, characters, search,
+`apply-sql`, `dump`, `restore`, `restart`, `status`.
+
+The dangerous one is not a deploy command. `configure` re-runs the world
+import, and on a database this script did not bootstrap — no marker directory,
+`realmd.account` already present — the import bookkeeping finds no state,
+says so, and lets every import run again, over live data. `run-k8s` applying
+this project's own manifests into a namespace a controller already owns is
+the more obvious hazard but the less costly one.
+
+The flag is validated strictly rather than tested for truthiness: anything
+that is not exactly `0` or `1` is an error, because the direction that fails
+quietly is a typo reading as "not managed".
+
 A worked example: a k8s server on another host, its MariaDB in podman beside
 it, driven from a machine with neither `kubectl` nor the password on it.
 

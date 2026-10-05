@@ -286,7 +286,7 @@ SETTING_KEYS=(
     IMAGE_TAG SERVER_CONTAINER_NAME K8S_NAMESPACE CUSTOM_SQL
     K8S_STORAGE_TYPE K8S_DATA_HOSTPATH K8S_DB_HOSTPATH K8S_STORAGECLASS
     DB_TRANSPORT SERVER_TRANSPORT DB_POD_SELECTOR SERVER_POD_SELECTOR SERVER_FIFO
-    DB_SSH_HOST SERVER_SSH_HOST SERVER_K8S_CONTAINER
+    DB_SSH_HOST SERVER_SSH_HOST SERVER_K8S_CONTAINER MANAGED_EXTERNALLY
 )
 
 _settings() {
@@ -351,6 +351,17 @@ _settings() {
     # of: ..." to stderr on every single exec when the pod has init
     # containers — noise on top of real output. Naming it silences that.
     SERVER_K8S_CONTAINER="$(cfg_default SERVER_K8S_CONTAINER "")"
+    # MANAGED_EXTERNALLY=1 says this profile describes a server something
+    # ELSE provisions — Ansible, a GitOps controller, a CI pipeline. This
+    # script may then administer it (accounts, SQL, dumps, restarts) but must
+    # not provision it: see _refuse_if_managed.
+    #
+    # Validated strictly rather than tested for truthiness. The dangerous
+    # direction is a typo reading as "not managed", so anything that is not
+    # exactly 0 or 1 is an error instead of quietly meaning off.
+    MANAGED_EXTERNALLY="$(cfg_default MANAGED_EXTERNALLY 0)"
+    [[ "$MANAGED_EXTERNALLY" =~ ^[01]$ ]] \
+        || error_exit "MANAGED_EXTERNALLY must be 0 or 1 (got '${MANAGED_EXTERNALLY}')."
     REALM_ID="$(cfg_default REALM_ID 1)"
     REALM_PORT="$(cfg_default REALM_PORT 3724)"
     WORLD_PORT="$(cfg_default WORLD_PORT 8085)"
@@ -711,6 +722,24 @@ _db_transport() {
     warn "  checked: container '${DB_CONTAINER_NAME}' (docker, podman), pods '${DB_POD_SELECTOR}' in ${K8S_NAMESPACE}, tcp ${DB_HOST}:${DB_PORT}"
     warn "  set DB_TRANSPORT (docker|podman|kubectl|tcp) and DB_HOST/DB_PORT to point at it explicitly."
     return 1
+}
+
+# _refuse_if_managed <command> — the guard for anything that provisions,
+# destroys or re-bootstraps a server.
+#
+# Blocked in the ENGINE and not only in the front-end: a front-end-only check
+# leaves the same mistake available to any script, and the engine is what
+# holds the destructive power. The worst of these is not a deploy command at
+# all — 'configure' re-runs the world import, and on a database this script
+# did not bootstrap (no marker directory, realmd.account already present)
+# _db_seed_applied_from_markers warns and lets every import run again, over
+# live data.
+_refuse_if_managed() {
+    [[ "$MANAGED_EXTERNALLY" == "1" ]] || return 0
+    warn "'${1}' provisions or re-bootstraps a server, and this profile${PROFILE:+ (${PROFILE})} is marked"
+    warn "MANAGED_EXTERNALLY=1 — something else owns it (Ansible, a GitOps controller, CI)."
+    warn "Administration still works: accounts, characters, search, apply-sql, dump, restore, restart, status."
+    error_exit "Refusing to run '${1}' against an externally managed server."
 }
 
 # _db_require — resolve the transport for its side effects only, so a command
@@ -1182,6 +1211,7 @@ _effective_conf_source() {
 cmd_configure() {
     header "nordrassil — Configure"
     _settings
+    _refuse_if_managed configure
     while [[ $# -gt 0 ]]; do case "$1" in
         --custom) CUSTOM_SQL="$2"; shift 2 ;;
         *) error_exit "configure: unknown flag: $1" ;;
@@ -1336,6 +1366,7 @@ _stop_stdin_holder() {
 cmd_start() {
     header "nordrassil — Start (local)"
     _settings
+    _refuse_if_managed start
 
     [[ -f "${ETC_DIR}/mangosd.conf" ]] || error_exit "Not configured yet — run 'configure' first."
     _ensure_local_mariadb
@@ -1393,6 +1424,7 @@ cmd_start() {
 cmd_stop() {
     header "nordrassil — Stop (local)"
     _settings
+    _refuse_if_managed stop
 
     local realmd_pf="${PF_DIR}/realmd.pid" mangosd_pf="${PF_DIR}/mangosd.pid"
 
@@ -1960,6 +1992,7 @@ cmd_search() {
 cmd_edit() {
     header "nordrassil — Edit conf files"
     _settings
+    _refuse_if_managed edit
 
     local file=""
     while [[ $# -gt 0 ]]; do case "$1" in
@@ -1991,6 +2024,7 @@ cmd_edit() {
 cmd_build_image() {
     header "nordrassil — Build Docker image"
     _settings
+    _refuse_if_managed build-image
     _check_docker
 
     [[ -d "$SOURCE_DIR" ]] || error_exit "SOURCE_DIR not set or missing — run 'configure' first."
@@ -2036,6 +2070,7 @@ cmd_build_image() {
 cmd_run_docker() {
     header "nordrassil — Run (Docker, LAN)"
     _settings
+    _refuse_if_managed run-docker
     _check_docker
 
     local force=0
@@ -2096,6 +2131,7 @@ cmd_run_docker() {
 cmd_stop_docker() {
     header "nordrassil — Stop (Docker)"
     _settings
+    _refuse_if_managed stop-docker
 
     docker inspect --type container "$SERVER_CONTAINER_NAME" &>/dev/null \
         || { info "Container '${SERVER_CONTAINER_NAME}' not found — nothing to stop."; return; }
@@ -2156,6 +2192,7 @@ inject_block() {
 cmd_run_k8s() {
     header "nordrassil — Run (Kubernetes, LAN via hostNetwork)"
     _settings
+    _refuse_if_managed run-k8s
 
     # Storage backend, namespace and realm address come from config (set them
     # with 'set K8S_STORAGE_TYPE hostpath|storageclass', 'set K8S_DATA_HOSTPATH',
@@ -2327,6 +2364,7 @@ cmd_run_k8s() {
 cmd_stop_k8s() {
     header "nordrassil — Stop (Kubernetes)"
     _settings
+    _refuse_if_managed stop-k8s
 
     command -v kubectl &>/dev/null || error_exit "kubectl not found."
 
@@ -2869,6 +2907,15 @@ Profiles (one per server):
 
   DB_PASS=ask prompts once per session per profile, cached in
   $XDG_RUNTIME_DIR (tmpfs, 0600, gone on logout). 'forget' clears it.
+
+  set MANAGED_EXTERNALLY 1     this server is provisioned by something else
+                               (Ansible, GitOps, CI). configure, build-image,
+                               run-docker, stop-docker, run-k8s, stop-k8s,
+                               start, stop and edit are then REFUSED;
+                               accounts, characters, search, apply-sql, dump,
+                               restore, restart and status still work.
+                               Mainly it stops 'configure' re-running the
+                               world import over live data.
 
   A worked example — k8s server on another host, its MariaDB in podman
   beside it, driven from a machine with neither kubectl nor the password:
