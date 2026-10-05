@@ -153,6 +153,21 @@ trap 'echo "" >&2; warn "Interrupted."; exit 130' INT TERM
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nordrassil"
 CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
 CONFIG_FILE="${CONFIG_DIR}/nordrassil.conf"
+# PROFILES. One file per server, layered OVER nordrassil.conf: a key present
+# in the active profile wins, anything absent falls through to the base file.
+# That way shared settings (SOURCE_DIR, WOW_PATCH, rates) stay in one place
+# and a profile only carries what actually differs — which, for a remote
+# server, is the transports, the selectors and the credentials.
+#
+# Selected with --profile NAME or $NORDRASSIL_PROFILE. With none active, this
+# script behaves exactly as it did before profiles existed.
+DUMP_DIR="${CONFIG_DIR}/dumps"
+# The four databases a VMaNGOS server uses. Fixed rather than configurable
+# because _db_bootstrap targets these names literally when it imports.
+NORDRASSIL_DBS=(mangos characters realmd logs)
+PROFILE_DIR="${CONFIG_DIR}/profiles"
+PROFILE="${NORDRASSIL_PROFILE:-}"
+PROFILE_FILE=""
 BUILD_DIR="${CONFIG_DIR}/build"
 INSTALL_DIR="${CONFIG_DIR}/install"
 SRC_UNPACK_DIR="${CONFIG_DIR}/src"
@@ -192,9 +207,23 @@ ACE_DEPS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ace-wrappers/${ACE_BUILD_VERSION}/
 # script uses). Shared by cfg_set, the conf renderers and render_template.
 _sed_escape() { printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'; }
 
+# _cfg_has <file> <key> / _cfg_read <file> <key> — presence and value.
+# Presence rather than a non-empty value is what the layering tests, so a
+# profile can deliberately blank a key the base file sets (clearing an
+# inherited DB_SSH_HOST, say) instead of being unable to override it.
+_cfg_has()  { [[ -n "$1" ]] && grep -qE "^${2}=" "$1" 2>/dev/null; }
+_cfg_read() { grep -E "^${2}=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' || true; }
+
 cfg_get() {
-    grep -E "^${1}=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' || true
+    if _cfg_has "$PROFILE_FILE" "$1"; then
+        _cfg_read "$PROFILE_FILE" "$1"
+        return 0
+    fi
+    _cfg_read "$CONFIG_FILE" "$1"
 }
+
+# _cfg_target — the file 'set' writes to: the active profile, else the base.
+_cfg_target() { printf '%s' "${PROFILE_FILE:-$CONFIG_FILE}"; }
 cfg_set() {
     local key="$1" val="$2" quoted
     # The key is spliced into a regex and the value into a sed replacement;
@@ -202,13 +231,27 @@ cfg_set() {
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || error_exit "set: invalid key '${key}' (letters, digits, underscore)."
     [[ "$val" != *$'\n'* ]] || error_exit "set: ${key}: value must not contain a newline."
     quoted="\"${val}\""
-    touch "$CONFIG_FILE"
-    if grep -qE "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-        sed -i.bak "s|^${key}=.*|${key}=$(_sed_escape "$quoted")|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+    local file; file="$(_cfg_target)"
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    if grep -qE "^${key}=" "$file" 2>/dev/null; then
+        sed -i.bak "s|^${key}=.*|${key}=$(_sed_escape "$quoted")|" "$file" && rm -f "${file}.bak"
     else
-        echo "${key}=${quoted}" >> "$CONFIG_FILE"
+        echo "${key}=${quoted}" >> "$file"
     fi
 }
+# _profile_activate <name> — point the config layer at a profile.
+# The name becomes a filename, so it is restricted rather than trusted: no
+# slashes, no leading dot, which rules out traversal and dotfiles both.
+_profile_activate() {
+    local name="$1"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+        || error_exit "profile: invalid name '${name}' (letters, digits, then . _ - )."
+    [[ "$name" != *..* ]] || error_exit "profile: invalid name '${name}'."
+    PROFILE="$name"
+    PROFILE_FILE="${PROFILE_DIR}/${name}.conf"
+}
+
 cfg_default() {
     # cfg_default KEY DEFAULT — returns existing value or DEFAULT (does not persist)
     local val
@@ -242,6 +285,8 @@ SETTING_KEYS=(
     REQ_EMAIL_VERIFICATION STRICT_VERSION_CHECK WARDEN_ENABLED STRICT_PLAYER_NAMES
     IMAGE_TAG SERVER_CONTAINER_NAME K8S_NAMESPACE CUSTOM_SQL
     K8S_STORAGE_TYPE K8S_DATA_HOSTPATH K8S_DB_HOSTPATH K8S_STORAGECLASS
+    DB_TRANSPORT SERVER_TRANSPORT DB_POD_SELECTOR SERVER_POD_SELECTOR SERVER_FIFO
+    DB_SSH_HOST SERVER_SSH_HOST SERVER_K8S_CONTAINER MANAGED_EXTERNALLY
 )
 
 _settings() {
@@ -264,6 +309,59 @@ _settings() {
     # here just needs to keep matching reality, not the project's new name.
     DB_CONTAINER_NAME="$(cfg_default DB_CONTAINER_NAME nordrassil-mariadb)"
     DB_VOLUME="$(cfg_default DB_VOLUME vanilla-wow-mariadb-data)"
+
+    # TRANSPORTS. How to reach the database and how to reach mangosd are two
+    # independent questions, and conflating them is what made this script
+    # unable to describe a real deployment: the kuat homelab runs the server
+    # as a k8s Deployment while its MariaDB is a podman quadlet on the host,
+    # so no single local/docker/k8s answer is correct for it.
+    #
+    #   DB_TRANSPORT      auto | docker | kubectl | tcp
+    #   SERVER_TRANSPORT  auto | local  | docker  | kubectl
+    #
+    # 'auto' keeps the pre-split behaviour: probe for a running local
+    # container first, then the cluster, then a TCP endpoint. Set either
+    # explicitly to point this script at a deployment it cannot guess.
+    #
+    # 'tcp' uses DB_HOST/DB_PORT, which until now were only ever written into
+    # the rendered conf files — the server's own connection string — and never
+    # used for this script's queries. It needs a mariadb client on this host.
+    DB_TRANSPORT="$(cfg_default DB_TRANSPORT auto)"
+    SERVER_TRANSPORT="$(cfg_default SERVER_TRANSPORT auto)"
+    # Label selectors and the console FIFO path are settings rather than
+    # constants for the same reason: they were hardcoded to this project's own
+    # k8s templates, so any other deployment's pods were simply invisible.
+    DB_POD_SELECTOR="$(cfg_default DB_POD_SELECTOR app=vanilla-wow-mariadb)"
+    SERVER_POD_SELECTOR="$(cfg_default SERVER_POD_SELECTOR app=vanilla-wow-server)"
+    # Where mangosd's console FIFO lives INSIDE the container. This repo's
+    # image puts it at /app; kuat's azeroth image uses /opt/azeroth.
+    SERVER_FIFO="$(cfg_default SERVER_FIFO /app/mangosd.stdin)"
+    # SSH is a THIRD axis, orthogonal to both transports: it says where the
+    # orchestrator runs, not which one. 'kubectl' + SERVER_SSH_HOST=meksha
+    # runs kubectl on meksha; 'podman' + DB_SSH_HOST=meksha runs podman
+    # there. Treating remoteness as another transport value would multiply
+    # the cases instead of adding one, and nothing about reaching a docker
+    # socket changes because the socket is on another machine.
+    #
+    # Empty means local. Needs key-based ssh: every call is BatchMode.
+    DB_SSH_HOST="$(cfg_default DB_SSH_HOST "")"
+    SERVER_SSH_HOST="$(cfg_default SERVER_SSH_HOST "")"
+    # Which container in the server pod holds mangosd. Empty lets kubectl
+    # pick, which is right but makes it print "Defaulted container ... out
+    # of: ..." to stderr on every single exec when the pod has init
+    # containers — noise on top of real output. Naming it silences that.
+    SERVER_K8S_CONTAINER="$(cfg_default SERVER_K8S_CONTAINER "")"
+    # MANAGED_EXTERNALLY=1 says this profile describes a server something
+    # ELSE provisions — Ansible, a GitOps controller, a CI pipeline. This
+    # script may then administer it (accounts, SQL, dumps, restarts) but must
+    # not provision it: see _refuse_if_managed.
+    #
+    # Validated strictly rather than tested for truthiness. The dangerous
+    # direction is a typo reading as "not managed", so anything that is not
+    # exactly 0 or 1 is an error instead of quietly meaning off.
+    MANAGED_EXTERNALLY="$(cfg_default MANAGED_EXTERNALLY 0)"
+    [[ "$MANAGED_EXTERNALLY" =~ ^[01]$ ]] \
+        || error_exit "MANAGED_EXTERNALLY must be 0 or 1 (got '${MANAGED_EXTERNALLY}')."
     REALM_ID="$(cfg_default REALM_ID 1)"
     REALM_PORT="$(cfg_default REALM_PORT 3724)"
     WORLD_PORT="$(cfg_default WORLD_PORT 8085)"
@@ -444,16 +542,301 @@ cmd_install_deps() {
 # root — not by everyone, and not by a casual 'ps'. Removing that too would
 # mean not handing the password to a client process at all.
 
+# -----------------------------------------------------------------------------
+# Transports
+#
+# Two independent axes. See the DB_TRANSPORT note in _settings for why: a
+# deployment can perfectly well run its server in k8s and its database
+# somewhere else entirely, and the single local/docker/k8s answer this script
+# used to insist on could not express that.
+# -----------------------------------------------------------------------------
+
+# _shq <string> — single-quote one argument for a remote POSIX shell.
+# _shq_argv <argv...> — the same for a whole command line.
+#
+# ssh does NOT take an argv. It joins its arguments with spaces and hands the
+# resulting STRING to a shell on the far side, which parses it again. So
+#   ssh h sh -c 'cat > /x'
+# arrives as `sh -c cat > /x` and the redirect happens in the login shell,
+# writing /x on the remote host instead of inside the container. Anything
+# sent over ssh has to be quoted for that second parse. Single quotes with
+# '\'' for embedded quotes is the POSIX-portable form; bash's printf %q is
+# not, and the remote end is whatever login shell the user has.
+_shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+_shq_argv() { local a q=""; for a in "$@"; do q+="$(_shq "$a") "; done; printf '%s' "$q"; }
+
+# _remote_run <host> <argv...> — run a command on another host. stdin is
+# forwarded; callers that must not consume it redirect </dev/null, the same
+# discipline as _db_client vs _db_client_stdin.
+_remote_run() {
+    local host="$1"; shift
+    ssh -o BatchMode=yes "$host" "$(_shq_argv "$@")"
+}
+
+# _remote_pw_run <host> <want_stdin> <password> <argv...> — as above, but
+# delivers a password through the remote shell's environment rather than its
+# argv, by sending it as the first line of stdin and having the far side
+# read exactly that one line. A password in a remote command string would be
+# visible in `ps` on that host, which is the thing the local paths already
+# take care to avoid.
+_remote_pw_run() {
+    local host="$1" want_stdin="$2" pw="$3"; shift 3
+    local remote="IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec $(_shq_argv "$@")"
+    if [[ -n "$want_stdin" ]]; then
+        { printf '%s\n' "$pw"; cat; } | ssh -o BatchMode=yes "$host" "$remote"
+    else
+        printf '%s\n' "$pw" | ssh -o BatchMode=yes "$host" "$remote"
+    fi
+}
+
+# _kube <ssh host or empty> <kubectl args...> — kubectl, here or there.
+# stdin is forwarded; see _remote_run.
+_kube() {
+    local host="$1"; shift
+    local ctx_flags; ctx_flags="$(kubectl_context_flag)"
+    if [[ -z "$host" ]]; then
+        command -v kubectl &>/dev/null || {
+            warn "kubectl not found on this host. Set DB_SSH_HOST/SERVER_SSH_HOST to run it on the server instead."
+            return 1
+        }
+        # shellcheck disable=SC2086
+        kubectl $ctx_flags "$@"
+    else
+        # shellcheck disable=SC2086
+        _remote_run "$host" kubectl $ctx_flags "$@"
+    fi
+}
+
+# _db_password — the password to authenticate with, prompting if asked to.
+#
+# DB_PASS=ask means "prompt, once per session, per profile". The answer is
+# cached in $XDG_RUNTIME_DIR, which is tmpfs, mode 0700 and owned by this
+# user: it survives for the login session and is gone on logout or reboot,
+# which is the lifetime wanted. With no XDG_RUNTIME_DIR there is nowhere
+# appropriate to put it, so it prompts every time rather than writing a
+# password into a persistent file.
+#
+# Prompting reads and writes /dev/tty, never stdin/stdout: callers run
+# queries inside $(...) and pipe SQL in, so a prompt on either would end up
+# captured as query output or eaten as SQL.
+_db_password() {
+    [[ "$DB_PASS" != "ask" ]] && { printf '%s' "$DB_PASS"; return 0; }
+
+    local cache=""
+    if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        install -d -m 0700 "${XDG_RUNTIME_DIR}/nordrassil" 2>/dev/null || true
+        cache="${XDG_RUNTIME_DIR}/nordrassil/${PROFILE:-default}.dbpass"
+        [[ -f "$cache" ]] && { cat "$cache"; return 0; }
+    fi
+
+    [[ -r /dev/tty && -w /dev/tty ]] || {
+        warn "DB_PASS=ask needs a terminal to prompt on, and there is none."
+        warn "  set DB_PASS explicitly for non-interactive use."
+        return 1
+    }
+    local pw
+    printf 'Database password for %s: ' "${PROFILE:-default}" >/dev/tty
+    IFS= read -rs pw </dev/tty
+    printf '\n' >/dev/tty
+    [[ -n "$pw" ]] || { warn "No password entered."; return 1; }
+    # umask in a subshell so the file cannot exist group/world-readable even
+    # momentarily between creation and a chmod.
+    [[ -n "$cache" ]] && ( umask 077; printf '%s' "$pw" >"$cache" )
+    printf '%s' "$pw"
+}
+
+# _kube_pick_pod <label selector> — one Running, non-terminating pod name.
+#
+# Deliberately NOT `jsonpath={.items[0].metadata.name}`, which is what the
+# rest of this script used to do: .items[0] is simply the first pod the API
+# returns, which during a rollout is as likely to be a Terminating one as the
+# live one — and exec'ing into a pod that is going away fails in a way that
+# reads like a connection problem. A terminating pod still reports phase
+# Running, so the phase alone is not enough; a deletionTimestamp is the thing
+# that distinguishes it, hence the two-field line and `NF==1`.
+_kube_pick_pod() {
+    local selector="$1" host="${2:-}" pod
+    pod="$(_kube "$host" get pods -n "$K8S_NAMESPACE" -l "$selector" \
+             --field-selector=status.phase=Running \
+             -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' \
+             </dev/null 2>/dev/null \
+           | awk 'NF==1{print $1; exit}')" || pod=""
+    [[ -n "$pod" ]] || {
+        warn "No Running pod matching '${selector}' in namespace ${K8S_NAMESPACE}${host:+ on ${host}}."
+        return 1
+    }
+    printf '%s' "$pod"
+}
+
+# _container_state <docker|podman> <ssh host or empty> <name> — a container's
+# status, asked of the engine that actually holds it. --type container because
+# SERVER_CONTAINER_NAME and IMAGE_TAG share a base name and a plain inspect
+# falls back to matching images, which would report an unrelated image's state
+# instead of "not created".
+_container_state() {
+    local engine="$1" host="$2" name="$3" out
+    if [[ -z "$host" ]]; then
+        out="$("$engine" inspect --type container "$name" --format='{{.State.Status}}' 2>/dev/null)" || out=""
+    else
+        out="$(_remote_run "$host" "$engine" inspect --type container "$name" \
+                 --format='{{.State.Status}}' </dev/null 2>/dev/null)" || out=""
+    fi
+    printf '%s' "${out:-not created}"
+}
+
+# _db_transport — echoes the resolved DB transport, autodetecting when 'auto'.
+_db_transport() {
+    case "$DB_TRANSPORT" in
+        docker|podman|kubectl|tcp) printf '%s' "$DB_TRANSPORT"; return 0 ;;
+        auto) ;;
+        *) error_exit "DB_TRANSPORT must be auto|docker|podman|kubectl|tcp (got '${DB_TRANSPORT}')." ;;
+    esac
+
+    # Probing across ssh would mean several round trips on every invocation,
+    # and guessing is the wrong default for a machine that is not this one.
+    [[ -z "$DB_SSH_HOST" ]] || error_exit \
+        "DB_TRANSPORT=auto cannot probe a remote host; set it to docker|podman|kubectl|tcp for DB_SSH_HOST=${DB_SSH_HOST}."
+
+    # Probe order preserves the behaviour from before the split: the local
+    # container was the only thing the DB helpers ever looked at, so it stays
+    # first and an existing setup keeps working untouched.
+    if [[ "$(docker inspect --type container "$DB_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]]; then
+        printf 'docker'; return 0
+    fi
+    if [[ "$(podman inspect --type container "$DB_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]]; then
+        printf 'podman'; return 0
+    fi
+    if command -v kubectl &>/dev/null; then
+        local ctx_flags; ctx_flags="$(kubectl_context_flag)"
+        # shellcheck disable=SC2086
+        if kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l "$DB_POD_SELECTOR" --no-headers 2>/dev/null | grep -q Running; then
+            printf 'kubectl'; return 0
+        fi
+    fi
+    if command -v mariadb &>/dev/null \
+       && timeout 3 bash -c "echo >/dev/tcp/${DB_HOST}/${DB_PORT}" 2>/dev/null; then
+        printf 'tcp'; return 0
+    fi
+
+    warn "No reachable database found."
+    warn "  checked: container '${DB_CONTAINER_NAME}' (docker, podman), pods '${DB_POD_SELECTOR}' in ${K8S_NAMESPACE}, tcp ${DB_HOST}:${DB_PORT}"
+    warn "  set DB_TRANSPORT (docker|podman|kubectl|tcp) and DB_HOST/DB_PORT to point at it explicitly."
+    return 1
+}
+
+# _refuse_if_managed <command> — the guard for anything that provisions,
+# destroys or re-bootstraps a server.
+#
+# Blocked in the ENGINE and not only in the front-end: a front-end-only check
+# leaves the same mistake available to any script, and the engine is what
+# holds the destructive power. The worst of these is not a deploy command at
+# all — 'configure' re-runs the world import, and on a database this script
+# did not bootstrap (no marker directory, realmd.account already present)
+# _db_seed_applied_from_markers warns and lets every import run again, over
+# live data.
+_refuse_if_managed() {
+    [[ "$MANAGED_EXTERNALLY" == "1" ]] || return 0
+    warn "'${1}' provisions or re-bootstraps a server, and this profile${PROFILE:+ (${PROFILE})} is marked"
+    warn "MANAGED_EXTERNALLY=1 — something else owns it (Ansible, a GitOps controller, CI)."
+    warn "Administration still works: accounts, characters, search, apply-sql, dump, restore, restart, status."
+    error_exit "Refusing to run '${1}' against an externally managed server."
+}
+
+# _db_require — resolve the transport for its side effects only, so a command
+# fails with a useful message before it starts prompting for arguments.
+_db_require() { _db_transport >/dev/null; }
+
+# _db_client <mariadb args...> — runs the mariadb client against the
+# configured database, whatever it takes to reach it. stdin is passed through,
+# so callers can pipe SQL in. The single place that knows how to reach a
+# database; every query helper above is a one-line wrapper over this.
+_db_client() {
+    _db_run "" mariadb "$@"
+}
+
+# _db_client_stdin <mariadb args...> — as above, but forwards this shell's
+# stdin to the client, for piping a .sql file in.
+#
+# The two are separate because forwarding stdin when the caller did not ask
+# for it is actively destructive: `docker exec -i` (and the `cat` in the
+# kubectl path) will drain whatever stdin happens to be connected. The
+# migration loop in _db_bootstrap reads its file list on stdin and calls
+# _db_is_applied/_db_mark_applied per iteration, so a stdin-forwarding
+# _db_exec eats the list. Measured, not theorised: a 5-line loop saw 1 line.
+_db_client_stdin() {
+    _db_run 1 mariadb "$@"
+}
+
+# _db_dump <mariadb-dump args...> — the dump client rather than the query
+# client, reached exactly the same way. stdin is not forwarded; the dump
+# comes back on stdout, which is why nothing else may be written there.
+_db_dump() {
+    _db_run "" mariadb-dump "$@"
+}
+
+# _db_run <want_stdin> <mariadb args...> — the single place that knows how to
+# reach a database. Do not call directly; use _db_client/_db_client_stdin.
+_db_run() {
+    local want_stdin="$1" client="$2"; shift 2
+    # Resolved once per shell. _db_transport's 'auto' probe is cheap when it
+    # succeeds, but the DB bootstrap issues dozens of statements and there is
+    # no reason to re-probe for each. Callers that run this inside a $(...)
+    # substitution get their own subshell and so resolve once more —
+    # harmless, and not worth contorting the call sites to avoid.
+    if [[ -z "${_DB_T:-}" ]]; then
+        _DB_T="$(_db_transport)" || return 1
+    fi
+    local pw; pw="$(_db_password)" || return 1
+
+    case "$_DB_T" in
+        docker|podman)
+            local -a cmd=( "$_DB_T" exec )
+            # -i only when the caller asked for stdin: see _db_client_stdin.
+            [[ -n "$want_stdin" ]] && cmd+=( -i )
+            cmd+=( -e MYSQL_PWD "$DB_CONTAINER_NAME" "$client" -u"$DB_USER" "$@" )
+            if [[ -z "$DB_SSH_HOST" ]]; then
+                # The password stays in this process's environment, never in
+                # argv — readable through /proc by this user and root, not by
+                # a casual `ps`.
+                if [[ -n "$want_stdin" ]]; then
+                    MYSQL_PWD="$pw" "${cmd[@]}"
+                else
+                    MYSQL_PWD="$pw" "${cmd[@]}" </dev/null
+                fi
+            else
+                _remote_pw_run "$DB_SSH_HOST" "$want_stdin" "$pw" "${cmd[@]}"
+            fi
+            ;;
+        kubectl)
+            _kube_mariadb "$want_stdin" "$pw" "$client" "$@"
+            ;;
+        tcp)
+            # --ssl-verify-server-cert=0 is explicit rather than left to the
+            # client, which otherwise disables it anyway and prints a warning
+            # to stderr on every single call. Saying it here keeps the output
+            # of parsed queries clean and makes the choice visible: this is a
+            # LAN connection to a server with no certificate of its own.
+            local -a cmd=( "$client" -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER"
+                           --ssl-verify-server-cert=0 "$@" )
+            if [[ -n "$want_stdin" ]]; then
+                MYSQL_PWD="$pw" "${cmd[@]}"
+            else
+                MYSQL_PWD="$pw" "${cmd[@]}" </dev/null
+            fi
+            ;;
+    esac
+}
+
 _db_exec() {
     # _db_exec <sql>
-    MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -e "$1"
+    _db_client -e "$1"
 }
 
 _db_import() {
     # _db_import <database> <file>
     local db="$1" file="$2"
     [[ -f "$file" ]] || { warn "Missing SQL file, skipping: ${file}"; return 0; }
-    MYSQL_PWD="$DB_PASS" docker exec -i -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" "$db" < "$file"
+    _db_client_stdin "$db" < "$file"
 }
 
 _ensure_local_mariadb() {
@@ -506,14 +889,14 @@ _ensure_local_mariadb() {
 # _db_table_exists <database> <table>
 _db_table_exists() {
     local out
-    out="$(_db_query_raw docker "SHOW TABLES FROM ${1} LIKE '$(_sql_escape "$2")';" 2>/dev/null)" || out=""
+    out="$(_db_query_raw "SHOW TABLES FROM ${1} LIKE '$(_sql_escape "$2")';" 2>/dev/null)" || out=""
     [[ -n "$out" ]]
 }
 
 # _db_is_applied <name>
 _db_is_applied() {
     local out
-    out="$(_db_query_raw docker "SELECT 1 FROM realmd.nordrassil_applied WHERE name='$(_sql_escape "$1")' LIMIT 1;" 2>/dev/null)" || out=""
+    out="$(_db_query_raw "SELECT 1 FROM realmd.nordrassil_applied WHERE name='$(_sql_escape "$1")' LIMIT 1;" 2>/dev/null)" || out=""
     [[ -n "$out" ]]
 }
 
@@ -828,6 +1211,7 @@ _effective_conf_source() {
 cmd_configure() {
     header "nordrassil — Configure"
     _settings
+    _refuse_if_managed configure
     while [[ $# -gt 0 ]]; do case "$1" in
         --custom) CUSTOM_SQL="$2"; shift 2 ;;
         *) error_exit "configure: unknown flag: $1" ;;
@@ -982,6 +1366,7 @@ _stop_stdin_holder() {
 cmd_start() {
     header "nordrassil — Start (local)"
     _settings
+    _refuse_if_managed start
 
     [[ -f "${ETC_DIR}/mangosd.conf" ]] || error_exit "Not configured yet — run 'configure' first."
     _ensure_local_mariadb
@@ -1039,6 +1424,7 @@ cmd_start() {
 cmd_stop() {
     header "nordrassil — Stop (local)"
     _settings
+    _refuse_if_managed stop
 
     local realmd_pf="${PF_DIR}/realmd.pid" mangosd_pf="${PF_DIR}/mangosd.pid"
 
@@ -1057,22 +1443,86 @@ cmd_status() {
     header "nordrassil — Status"
     _settings
 
-    _section "Local MariaDB"
-    docker inspect --type container "$DB_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null || warn "Not created."
+    # This used to probe local docker unconditionally — `docker inspect` for
+    # the database, the server container and the image — which predates
+    # transports and was never migrated with the rest. The effect was that
+    # status looked IDENTICAL for every profile and could never show a
+    # correctly configured remote database as reachable, which reads exactly
+    # like switching profiles having no effect.
+    _section "Acting on"
+    info "profile:  ${PROFILE:-<base config>}"
 
-    _section "Local native processes"
-    pf_is_running "${PF_DIR}/realmd.pid"  && success "realmd running (port $(pf_port "${PF_DIR}/realmd.pid"))"  || info "realmd not running."
-    pf_is_running "${PF_DIR}/mangosd.pid" && success "mangosd running (port $(pf_port "${PF_DIR}/mangosd.pid"))" || info "mangosd not running."
+    local dbt srvt
+    dbt="$(_db_transport)" || dbt=""
+    srvt="$(_server_transport)" || srvt=""
+    # The ssh host is only shown where it is actually used. 'tcp' connects
+    # straight to DB_HOST:DB_PORT and 'local' runs here, so naming an ssh
+    # host alongside either would claim a hop that does not happen — and a
+    # leftover *_SSH_HOST from an earlier transport is worth pointing out
+    # rather than displaying as if it were in effect.
+    local db_via="" srv_via=""
+    case "$dbt" in docker|podman|kubectl) [[ -n "$DB_SSH_HOST" ]] && db_via=" on ${DB_SSH_HOST} (ssh)" ;; esac
+    case "$srvt" in docker|podman|kubectl) [[ -n "$SERVER_SSH_HOST" ]] && srv_via=" on ${SERVER_SSH_HOST} (ssh)" ;; esac
+    info "database: ${dbt:-<unresolved>}${db_via}"
+    info "server:   ${srvt:-<unresolved>}${srv_via}"
+    [[ "$dbt" == tcp && -n "$DB_SSH_HOST" ]] \
+        && info "          (DB_SSH_HOST=${DB_SSH_HOST} is unused by the tcp transport)"
+    [[ "$srvt" == local && -n "$SERVER_SSH_HOST" ]] \
+        && info "          (SERVER_SSH_HOST=${SERVER_SSH_HOST} is unused by the local transport)"
 
-    # --type container: SERVER_CONTAINER_NAME and IMAGE_TAG share a base
-    # name ("vanilla-wow-server"), and plain 'docker inspect' falls back to
-    # matching images when no container matches — without this it would
-    # always report the image's (unrelated) state here instead of "Not created".
-    _section "Server container"
-    docker inspect --type container "$SERVER_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null || info "Not created."
+    _section "Database"
+    case "$dbt" in
+        docker|podman) info "${dbt} container '${DB_CONTAINER_NAME}': $(_container_state "$dbt" "$DB_SSH_HOST" "$DB_CONTAINER_NAME")" ;;
+        kubectl)       info "pod '${DB_POD_SELECTOR}' in ${K8S_NAMESPACE}: $(_kube_pick_pod "$DB_POD_SELECTOR" "$DB_SSH_HOST" 2>/dev/null || echo 'none Running')" ;;
+        tcp)           info "endpoint ${DB_HOST}:${DB_PORT}" ;;
+        *)             warn "No database transport resolved (see above)." ;;
+    esac
+    if [[ -n "$dbt" ]]; then
+        # The actual test. Everything above only says whether the thing
+        # HOLDING the database can be reached; this says whether the database
+        # answers as this user, which is what a wrong connection gets wrong.
+        local ver
+        if ver="$(_db_query_raw 'SELECT VERSION();' 2>/dev/null)" && [[ -n "$ver" ]]; then
+            success "connected as '${DB_USER}' — MariaDB ${ver}"
+            local present=""
+            local d
+            for d in "${NORDRASSIL_DBS[@]}"; do
+                [[ -n "$(_db_query_raw "SHOW DATABASES LIKE '$(_sql_escape "$d")';" 2>/dev/null)" ]] \
+                    && present+="${d} " || present+="${d}(missing) "
+            done
+            info "databases: ${present}"
+        else
+            warn "could NOT query the database as '${DB_USER}'."
+            warn "  DB_TRANSPORT=${DB_TRANSPORT} DB_SSH_HOST=${DB_SSH_HOST:-<local>} DB_USER=${DB_USER}"
+            warn "  tcp also needs DB_HOST/DB_PORT; docker/podman need DB_CONTAINER_NAME."
+        fi
+    fi
 
-    _section "Docker image"
-    docker image inspect "$IMAGE_TAG" --format='{{.Id}}' 2>/dev/null || info "Not built."
+    _section "Server"
+    case "$srvt" in
+        local)
+            pf_is_running "${PF_DIR}/realmd.pid"  && success "realmd running (port $(pf_port "${PF_DIR}/realmd.pid"))"  || info "realmd not running."
+            pf_is_running "${PF_DIR}/mangosd.pid" && success "mangosd running (port $(pf_port "${PF_DIR}/mangosd.pid"))" || info "mangosd not running."
+            ;;
+        docker|podman)
+            info "${srvt} container '${SERVER_CONTAINER_NAME}': $(_container_state "$srvt" "$SERVER_SSH_HOST" "$SERVER_CONTAINER_NAME")"
+            ;;
+        kubectl)
+            local pod
+            if pod="$(_kube_pick_pod "$SERVER_POD_SELECTOR" "$SERVER_SSH_HOST" 2>/dev/null)"; then
+                success "pod ${pod} Running in ${K8S_NAMESPACE}"
+            else
+                warn "no Running pod matching '${SERVER_POD_SELECTOR}' in ${K8S_NAMESPACE}"
+            fi
+            ;;
+        *) warn "No server transport resolved (see above)." ;;
+    esac
+
+    # Only meaningful for a server this host builds and runs itself.
+    if [[ -z "$SERVER_SSH_HOST" && "$srvt" != "kubectl" ]]; then
+        _section "Local docker image"
+        docker image inspect "$IMAGE_TAG" --format='{{.Id}}' 2>/dev/null || info "Not built."
+    fi
 
     # realmlist.wtf syntax: 'set realmlist <address>[:<port>]' — the port
     # suffix is only needed when it's non-standard, the client already
@@ -1097,87 +1547,71 @@ cmd_status() {
 # than guessing).
 # -----------------------------------------------------------------------------
 
-# _detect_running_target — echoes "local"/"docker"/"k8s" on stdout for
-# whichever deployment mangosd is actually running in right now, prompting
-# if more than one qualifies. warn+return 1 if none does. Shared by every
-# command below that needs to reach a live mangosd console.
-_detect_running_target() {
+# _server_transport — echoes "local"/"docker"/"kubectl" on stdout for the
+# deployment whose mangosd console this script should talk to: the
+# SERVER_TRANSPORT setting if it names one, otherwise whichever is actually
+# running, prompting (via --where) if more than one qualifies. warn+return 1
+# if none does. Shared by every command that needs a live mangosd console.
+#
+# This is the SERVER half of the transport split — reaching the database is
+# _db_transport's problem and resolves separately, because the two need not
+# live in the same place.
+_server_transport() {
+    # An explicit setting wins outright. Probing can only see what this host
+    # happens to reach, and "where is mangosd running" is not the same
+    # question as "which deployment am I administering".
+    case "$SERVER_TRANSPORT" in
+        local|docker|podman|kubectl) printf '%s' "$SERVER_TRANSPORT"; return 0 ;;
+        auto) ;;
+        *) error_exit "SERVER_TRANSPORT must be auto|local|docker|podman|kubectl (got '${SERVER_TRANSPORT}')." ;;
+    esac
+
+    [[ -z "$SERVER_SSH_HOST" ]] || error_exit \
+        "SERVER_TRANSPORT=auto cannot probe a remote host; set it to docker|podman|kubectl for SERVER_SSH_HOST=${SERVER_SSH_HOST}."
+
     local -a targets=()
     pf_is_running "${PF_DIR}/mangosd.pid" && targets+=("local")
     [[ "$(docker inspect --type container "$SERVER_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]] \
         && targets+=("docker")
-    # Same --context/--kind target as the exec path below — otherwise the
-    # detection looks at the ambient kube context while the console command
-    # goes to the requested one.
-    local ctx_flags; ctx_flags="$(kubectl_context_flag)"
+    [[ "$(podman inspect --type container "$SERVER_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]] \
+        && targets+=("podman")
     if command -v kubectl &>/dev/null; then
+        # Same --context/--kind target as the exec path, otherwise detection
+        # looks at the ambient context while the command goes to another.
+        local ctx_flags; ctx_flags="$(kubectl_context_flag)"
         # shellcheck disable=SC2086
-        kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server --no-headers 2>/dev/null | grep -q Running \
-            && targets+=("k8s")
+        kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l "$SERVER_POD_SELECTOR" --no-headers 2>/dev/null | grep -q Running \
+            && targets+=("kubectl")
     fi
 
     if [[ ${#targets[@]} -eq 0 ]]; then
-        warn "mangosd doesn't appear to be running anywhere (checked local, docker, k8s). Start it first."
+        warn "mangosd doesn't appear to be running anywhere."
+        warn "  checked: local pidfile, container '${SERVER_CONTAINER_NAME}' (docker, podman), pods '${SERVER_POD_SELECTOR}' in ${K8S_NAMESPACE}"
+        warn "  set SERVER_TRANSPORT (local|docker|podman|kubectl) to name it explicitly."
         return 1
     fi
 
-    # WHERE (from --where local|docker|k8s) disambiguates when mangosd is running
-    # in more than one place; with a single target it's optional. The front-end
-    # asks the operator only when needed and passes --where.
     local chosen="${targets[0]}"
     if [[ ${#targets[@]} -gt 1 ]]; then
         if [[ -n "${WHERE:-}" ]]; then
-            printf '%s\n' "${targets[@]}" | grep -qx "$WHERE" \
+            # 'k8s' is still accepted: --where predates the transport split
+            # and the gum front-end still offers that spelling.
+            local w="$WHERE"; [[ "$w" == "k8s" ]] && w="kubectl"
+            printf '%s\n' "${targets[@]}" | grep -qx "$w" \
                 || { warn "--where '${WHERE}' isn't among the running targets: ${targets[*]}"; return 1; }
-            chosen="$WHERE"
+            chosen="$w"
         else
             warn "mangosd is running in more than one place (${targets[*]}). Pass --where <${targets[0]}|...> to choose."
             return 1
         fi
     fi
 
-    # k8s only: make sure a pod is actually addressable. Callers run this
-    # function in a $(...) subshell, so nothing assigned here survives —
-    # _send_console_cmd/_db_query resolve the context flags and pod name
-    # themselves for the k8s case.
-    if [[ "$chosen" == "k8s" ]]; then
-        local pod
-        # '|| pod=""': a failing kubectl must fall through to the warn below,
-        # not kill the script silently under set -e (stderr is muted).
-        # shellcheck disable=SC2086
-        pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || pod=""
-        if [[ -z "$pod" ]]; then
-            warn "No running vanilla-wow-server pod found in namespace ${K8S_NAMESPACE}."
-            return 1
-        fi
+    # Confirm a pod is addressable before the caller commits to it.
+    if [[ "$chosen" == "kubectl" ]]; then
+        _kube_pick_pod "$SERVER_POD_SELECTOR" "$SERVER_SSH_HOST" >/dev/null || return 1
     fi
 
-    echo "$chosen"
-}
-
-# _detect_db_target — like _detect_running_target, but for queries that only
-# need the database, not mangosd itself (e.g. search, which reads static
-# reference tables that don't require the server to be up at all). Local
-# native and Docker share the exact same local MariaDB container, so unlike
-# _detect_running_target there's nothing to disambiguate between them —
-# echoes "docker" for that shared container, "k8s" for the cluster's own
-# separate MariaDB pod.
-_detect_db_target() {
-    if [[ "$(docker inspect --type container "$DB_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]]; then
-        echo "docker"
-        return 0
-    fi
-    if command -v kubectl &>/dev/null; then
-        # Same --context/--kind target _db_query uses for the k8s case.
-        local ctx_flags; ctx_flags="$(kubectl_context_flag)"
-        # shellcheck disable=SC2086
-        if kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb --no-headers 2>/dev/null | grep -q Running; then
-            echo "k8s"
-            return 0
-        fi
-    fi
-    warn "No reachable database found (checked the local MariaDB container and K8s). Run 'configure' or 'run-k8s' first."
-    return 1
+    printf '%s' "$chosen"
 }
 
 # Escapes a value for embedding inside a single-quoted SQL string literal
@@ -1190,21 +1624,42 @@ _sql_escape() { printf '%s' "$1" | sed -e "s/\\\\/\\\\\\\\/g" -e "s/'/\\\\'/g"; 
 # argument would put it right back in this host's 'ps' output (see the note
 # above _db_exec). None of the callers need stdin for anything else.
 _kube_mariadb() {
-    local ctx_flags pod
-    ctx_flags="$(kubectl_context_flag)"
-    # '|| pod=""': a failing kubectl must reach the warn below instead of
-    # ending the script silently under set -e (stderr is muted).
-    # shellcheck disable=SC2086
-    pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || pod=""
-    if [[ -z "$pod" ]]; then
-        warn "No running vanilla-wow-mariadb pod found in namespace ${K8S_NAMESPACE}."
-        return 1
+    local want_stdin="$1" pw="$2" client="$3"; shift 3
+    local pod; pod="$(_kube_pick_pod "$DB_POD_SELECTOR" "$DB_SSH_HOST")" || return 1
+    # The password is the first line of stdin, consumed inside the pod by one
+    # POSIX `read` — specified not to read past the newline, so anything
+    # after it is still intact for the client. The previous version piped the
+    # password as the WHOLE of stdin, which silently left _db_import with no
+    # kubectl path at all. Not in argv, which is the point.
+    local inner='IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec "$@"'
+    local -a cmd=( exec -i -n "$K8S_NAMESPACE" "$pod" --
+                   sh -c "$inner" _ "$client" -u"$DB_USER" "$@" )
+    if [[ -n "$want_stdin" ]]; then
+        { printf '%s\n' "$pw"; cat; } | _kube "$DB_SSH_HOST" "${cmd[@]}"
+    else
+        printf '%s\n' "$pw" | _kube "$DB_SSH_HOST" "${cmd[@]}"
     fi
-    # sh -c '<script>' _ mariadb <args>: '_' becomes $0, so "$@" inside the
-    # script is exactly the command to run.
-    # shellcheck disable=SC2086
-    printf '%s' "$DB_PASS" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- \
-        sh -c 'MYSQL_PWD="$(cat)"; export MYSQL_PWD; exec "$@"' _ mariadb "$@"
+}
+
+# _db_report <what> <sql> — run a human-facing query and SAY SO when it
+# matches nothing.
+#
+# The mariadb client prints absolutely nothing for an empty result set — no
+# header, no empty table — so a search with no matches produced only this
+# script's own banner and exited 0, which is indistinguishable from the
+# command having failed. That is the bug class this script keeps tripping
+# over: success that looks like nothing happened.
+#
+# The result is captured rather than streamed so it can be tested for
+# emptiness. Rows still go to stdout and diagnostics to stderr, as everywhere.
+_db_report() {
+    local what="$1" sql="$2" out
+    out="$(_db_query "$sql")" || return 1
+    if [[ -z "${out//[[:space:]]/}" ]]; then
+        info "No ${what}."
+        return 0
+    fi
+    printf '%s\n' "$out"
 }
 
 # _db_query <target: local|docker|k8s> <sql> — local/docker share the same
@@ -1212,36 +1667,17 @@ _kube_mariadb() {
 # in the cluster (see the architecture note on templates/k8s/mariadb.yaml),
 # so that one needs its own kubectl exec instead of _db_exec's docker exec.
 _db_query() {
-    local tgt="$1" sql="$2"
-    case "$tgt" in
-        local|docker)
-            # -t (table format), not _db_exec's plain tab-separated output —
-            # every _db_query caller is a human-facing read, not the DB
-            # bootstrap machinery _db_exec also serves.
-            MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -t -e "$sql"
-            ;;
-        k8s)
-            _kube_mariadb -u"$DB_USER" -t -e "$sql"
-            ;;
-    esac
+    _db_client -t -e "$1"
 }
 
 # _db_query_raw <target> <sql> — like _db_query, but -N -B (no column
 # headers, tab-separated, no ASCII table borders) for callers that need to
 # actually parse a single value out of the result, not display it.
 _db_query_raw() {
-    local tgt="$1" sql="$2"
-    case "$tgt" in
-        local|docker)
-            MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -N -B -e "$sql"
-            ;;
-        k8s)
-            _kube_mariadb -u"$DB_USER" -N -B -e "$sql"
-            ;;
-    esac
+    _db_client -N -B -e "$1"
 }
 
-# _send_console_cmd <local|docker|k8s> <single console command line>
+# _send_console_cmd <local|docker|kubectl> <single console command line>
 _send_console_cmd() {
     local tgt="$1" line="$2"
     case "$tgt" in
@@ -1253,23 +1689,22 @@ _send_console_cmd() {
             fi
             printf '%s\n' "$line" > "$fifo"
             ;;
-        docker)
-            printf '%s\n' "$line" | docker exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > /app/mangosd.stdin" \
-                || { warn "Failed to reach the container's console FIFO."; return 1; }
-            ;;
-        k8s)
-            # Same --context/--kind resolution as _db_query's k8s case.
-            local ctx_flags pod
-            ctx_flags="$(kubectl_context_flag)"
-            # shellcheck disable=SC2086
-            pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-            if [[ -z "$pod" ]]; then
-                warn "No running vanilla-wow-server pod found in namespace ${K8S_NAMESPACE}."
-                return 1
+        docker|podman)
+            if [[ -z "$SERVER_SSH_HOST" ]]; then
+                printf '%s\n' "$line" | "$tgt" exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > ${SERVER_FIFO}" \
+                    || { warn "Failed to reach the container's console FIFO (${SERVER_FIFO})."; return 1; }
+            else
+                printf '%s\n' "$line" | _remote_run "$SERVER_SSH_HOST" \
+                    "$tgt" exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > ${SERVER_FIFO}" \
+                    || { warn "Failed to reach the container's console FIFO (${SERVER_FIFO}) on ${SERVER_SSH_HOST}."; return 1; }
             fi
-            # shellcheck disable=SC2086
-            printf '%s\n' "$line" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- sh -c "cat > /app/mangosd.stdin" \
-                || { warn "Failed to reach the pod's console FIFO."; return 1; }
+            ;;
+        kubectl)
+            local pod
+            pod="$(_kube_pick_pod "$SERVER_POD_SELECTOR" "$SERVER_SSH_HOST")" || return 1
+            printf '%s\n' "$line" | _kube "$SERVER_SSH_HOST" \
+                exec -i -n "$K8S_NAMESPACE" ${SERVER_K8S_CONTAINER:+-c "$SERVER_K8S_CONTAINER"} "$pod" -- sh -c "cat > ${SERVER_FIFO}" \
+                || { warn "Failed to reach the pod's console FIFO (${SERVER_FIFO})."; return 1; }
             ;;
     esac
 }
@@ -1305,7 +1740,7 @@ cmd_create_account() {
     [[ "$gm_num" =~ ^[0-6]$ ]] || error_exit "create-account: --level must be 0-6 (see the GM-level scale)."
 
     local target
-    target=$(_detect_running_target) || return 1
+    target=$(_server_transport) || return 1
 
     # 'account create' and 'account set gmlevel' can't be sent as one burst:
     # live-tested, sending both in a single write reliably fails the gmlevel
@@ -1323,7 +1758,7 @@ cmd_create_account() {
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
+        kubectl) info "Check: kubectl -n ${K8S_NAMESPACE} logs -l ${SERVER_POD_SELECTOR}" ;;
     esac
 
     success "Account '${user_input}' created (GM level: ${gm_num})."
@@ -1331,14 +1766,13 @@ cmd_create_account() {
 
 # _print_accounts_table <target> — shared by list-accounts and
 # delete-account (as a courtesy display before prompting for a username),
-# so delete-account doesn't need to run _detect_running_target a second time
+# so delete-account doesn't need to run _server_transport a second time
 # (and risk a second "which target?" prompt) just to show the same list.
 _print_accounts_table() {
-    local target="$1"
     # GM level lives in account_access (per-realm), not account.gmlevel,
     # which is vestigial (see create-account's notes). LEFT JOIN so an
     # account with no account_access row still shows up, as GM level 0.
-    _db_query "$target" \
+    _db_report "accounts on this realm" \
         "SELECT a.id, a.username, COALESCE(aa.gmlevel, 0) AS gmlevel, a.online, a.locked, a.last_login
          FROM realmd.account a LEFT JOIN realmd.account_access aa ON aa.id = a.id AND aa.RealmID = ${REALM_ID}
          ORDER BY a.username;"
@@ -1353,9 +1787,9 @@ cmd_list_accounts() {
     esac; done
 
     local target
-    target=$(_detect_running_target) || return 1
+    target=$(_server_transport) || return 1
 
-    _print_accounts_table "$target" || return 1
+    _print_accounts_table || return 1
 }
 
 cmd_delete_account() {
@@ -1374,7 +1808,7 @@ cmd_delete_account() {
     # Destructive (also removes the account's characters). The front-end confirms
     # before calling; the engine executes the named deletion directly.
     local target
-    target=$(_detect_running_target) || return 1
+    target=$(_server_transport) || return 1
 
     # Needed for the account_access cleanup below: that row can only be
     # looked up by account id, and 'account delete' removes the account row
@@ -1383,7 +1817,7 @@ cmd_delete_account() {
     # a failed query must be reported here — under set -e a bare failing
     # assignment would otherwise end the script with no message at all.
     local acc_id user_sql; user_sql="$(_sql_escape "${user_input^^}")"
-    acc_id=$(_db_query_raw "$target" "SELECT id FROM realmd.account WHERE username='${user_sql}';" 2>/dev/null) \
+    acc_id=$(_db_query_raw "SELECT id FROM realmd.account WHERE username='${user_sql}';" 2>/dev/null) \
         || { warn "Account id lookup failed (is MariaDB reachable with DB_USER/DB_PASS?) — the account_access cleanup below will be skipped."; acc_id=""; }
 
     _send_console_cmd "$target" "account delete ${user_input}" || return 1
@@ -1395,13 +1829,13 @@ cmd_delete_account() {
     # here so repeated create/delete cycles don't quietly accumulate junk.
     if [[ "$acc_id" =~ ^[0-9]+$ ]]; then
         sleep 2
-        _db_query "$target" "DELETE FROM realmd.account_access WHERE id=${acc_id};" &>/dev/null || true
+        _db_query "DELETE FROM realmd.account_access WHERE id=${acc_id};" &>/dev/null || true
     fi
 
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
+        kubectl) info "Check: kubectl -n ${K8S_NAMESPACE} logs -l ${SERVER_POD_SELECTOR}" ;;
     esac
 
     success "Delete command sent for '${user_input}'."
@@ -1423,14 +1857,14 @@ cmd_set_account_level() {
     [[ "$gm_num" =~ ^[0-6]$ ]] || error_exit "set-account-level: --level must be 0-6."
 
     local target
-    target=$(_detect_running_target) || return 1
+    target=$(_server_transport) || return 1
 
     _send_console_cmd "$target" "account set gmlevel ${user_input} ${gm_num}" || return 1
 
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
+        kubectl) info "Check: kubectl -n ${K8S_NAMESPACE} logs -l ${SERVER_POD_SELECTOR}" ;;
     esac
 
     success "GM level command sent for '${user_input}' (level: ${gm_num})."
@@ -1444,7 +1878,7 @@ cmd_set_account_level() {
 # sidestep for a specific character on a case-by-case basis, without
 # touching those rules for everyone else. This is a pure database
 # operation, not a console command, so it works even if mangosd isn't
-# running at all (_detect_db_target, not _detect_running_target) — but the
+# running at all (_db_require, not _server_transport) — but the
 # character must be offline: mangosd only reads a character's row from the
 # database at login, an online character's data lives in memory and a
 # logout would overwrite this change with whatever's already loaded there.
@@ -1462,13 +1896,13 @@ cmd_rename_character() {
     [[ -n "$new_name" ]] || error_exit "rename-character: --to is required (the new name)."
 
     local target
-    target=$(_detect_db_target) || return 1
+    _db_require || return 1
 
     local old_name_escaped; old_name_escaped="$(_sql_escape "$old_name")"
     local row guid online
     # See delete-account: stderr is muted, so a failed query is reported here
     # rather than silently ending the script under set -e.
-    row=$(_db_query_raw "$target" "SELECT guid, online FROM characters.characters WHERE name='${old_name_escaped}';" 2>/dev/null) \
+    row=$(_db_query_raw "SELECT guid, online FROM characters.characters WHERE name='${old_name_escaped}';" 2>/dev/null) \
         || { warn "Character lookup failed (is MariaDB reachable with DB_USER/DB_PASS?)."; return 1; }
     if [[ -z "$row" ]]; then
         warn "No character named '${old_name}' found."
@@ -1489,7 +1923,7 @@ cmd_rename_character() {
 
     local new_name_escaped; new_name_escaped="$(_sql_escape "$new_name")"
     local existing
-    existing=$(_db_query_raw "$target" "SELECT guid FROM characters.characters WHERE name='${new_name_escaped}';" 2>/dev/null) \
+    existing=$(_db_query_raw "SELECT guid FROM characters.characters WHERE name='${new_name_escaped}';" 2>/dev/null) \
         || { warn "Name availability check failed (is MariaDB reachable with DB_USER/DB_PASS?)."; return 1; }
     if [[ -n "$existing" && "$existing" != "$guid" ]]; then
         warn "'${new_name}' is already taken by another character."
@@ -1502,7 +1936,7 @@ cmd_rename_character() {
     # was already set (from an earlier attempt, or any other GM action)
     # and this UPDATE only ever touched the name column, never the flag
     # that actually drives the client's rename prompt.
-    _db_query "$target" "UPDATE characters.characters SET name='${new_name_escaped}', character_flags = character_flags & ~0x4000 WHERE guid=${guid};" &>/dev/null || return 1
+    _db_query "UPDATE characters.characters SET name='${new_name_escaped}', character_flags = character_flags & ~0x4000 WHERE guid=${guid};" &>/dev/null || return 1
     success "'${old_name}' renamed to '${new_name}'."
 }
 
@@ -1511,8 +1945,7 @@ cmd_rename_character() {
 # characters. All four are plain reference-data reads (no SRP6/console
 # involved, unlike the account commands), so this goes straight to the
 # database via _db_query, and works even if mangosd itself isn't running —
-# only the database needs to be up (_detect_db_target, not
-# _detect_running_target).
+# only the database needs to be up (_db_require, not _server_transport).
 # -----------------------------------------------------------------------------
 
 cmd_search() {
@@ -1529,7 +1962,7 @@ cmd_search() {
     [[ -n "$term" ]] || error_exit "search: --term is required."
 
     local target
-    target=$(_detect_db_target) || return 1
+    _db_require || return 1
     local term_escaped; term_escaped="$(_sql_escape "$term")"
 
     case "$kind" in
@@ -1540,14 +1973,14 @@ cmd_search() {
             # an item that changed since; the correlated subquery picks the
             # latest row at or before the configured WOW_PATCH, matching
             # what's actually loaded on this server.
-            _db_query "$target" \
+            _db_report "items matching '${term}'" \
                 "SELECT it.entry, it.name, it.quality FROM mangos.item_template it
                  WHERE it.name LIKE '%${term_escaped}%' AND it.patch = (
                      SELECT MAX(patch) FROM mangos.item_template it2 WHERE it2.entry = it.entry AND it2.patch <= ${WOW_PATCH}
                  ) ORDER BY it.name LIMIT 50;" || return 1
             ;;
         npcs)
-            _db_query "$target" \
+            _db_report "NPCs matching '${term}'" \
                 "SELECT ct.entry, ct.name, ct.subname FROM mangos.creature_template ct
                  WHERE ct.name LIKE '%${term_escaped}%' AND ct.patch = (
                      SELECT MAX(patch) FROM mangos.creature_template ct2 WHERE ct2.entry = ct.entry AND ct2.patch <= ${WOW_PATCH}
@@ -1556,12 +1989,12 @@ cmd_search() {
         teleports)
             # game_tele — the table the '.tele <name>' GM command itself
             # searches, no patch column here.
-            _db_query "$target" \
+            _db_report "teleport locations matching '${term}'" \
                 "SELECT id, name, map, ROUND(position_x,1) AS x, ROUND(position_y,1) AS y
                  FROM mangos.game_tele WHERE name LIKE '%${term_escaped}%' ORDER BY name LIMIT 50;" || return 1
             ;;
         characters)
-            _db_query "$target" \
+            _db_report "characters matching '${term}'" \
                 "SELECT guid, name, race, class, level FROM characters.characters
                  WHERE name LIKE '%${term_escaped}%' ORDER BY name LIMIT 50;" || return 1
             ;;
@@ -1580,6 +2013,7 @@ cmd_search() {
 cmd_edit() {
     header "nordrassil — Edit conf files"
     _settings
+    _refuse_if_managed edit
 
     local file=""
     while [[ $# -gt 0 ]]; do case "$1" in
@@ -1611,6 +2045,7 @@ cmd_edit() {
 cmd_build_image() {
     header "nordrassil — Build Docker image"
     _settings
+    _refuse_if_managed build-image
     _check_docker
 
     [[ -d "$SOURCE_DIR" ]] || error_exit "SOURCE_DIR not set or missing — run 'configure' first."
@@ -1656,6 +2091,7 @@ cmd_build_image() {
 cmd_run_docker() {
     header "nordrassil — Run (Docker, LAN)"
     _settings
+    _refuse_if_managed run-docker
     _check_docker
 
     local force=0
@@ -1716,6 +2152,7 @@ cmd_run_docker() {
 cmd_stop_docker() {
     header "nordrassil — Stop (Docker)"
     _settings
+    _refuse_if_managed stop-docker
 
     docker inspect --type container "$SERVER_CONTAINER_NAME" &>/dev/null \
         || { info "Container '${SERVER_CONTAINER_NAME}' not found — nothing to stop."; return; }
@@ -1776,6 +2213,7 @@ inject_block() {
 cmd_run_k8s() {
     header "nordrassil — Run (Kubernetes, LAN via hostNetwork)"
     _settings
+    _refuse_if_managed run-k8s
 
     # Storage backend, namespace and realm address come from config (set them
     # with 'set K8S_STORAGE_TYPE hostpath|storageclass', 'set K8S_DATA_HOSTPATH',
@@ -1947,6 +2385,7 @@ cmd_run_k8s() {
 cmd_stop_k8s() {
     header "nordrassil — Stop (Kubernetes)"
     _settings
+    _refuse_if_managed stop-k8s
 
     command -v kubectl &>/dev/null || error_exit "kubectl not found."
 
@@ -2007,7 +2446,402 @@ cmd_get() {
 # this to pre-fill its prompts with the current values.
 cmd_config() {
     _settings
+    # Both layers, separately rather than merged: when a value is surprising
+    # the useful question is which file it came from.
+    if [[ -n "$PROFILE" ]]; then
+        info "profile: ${PROFILE}  (${PROFILE_FILE})"
+        if [[ -f "$PROFILE_FILE" ]]; then cat "$PROFILE_FILE"; else info "  (empty)"; fi
+        info "base: ${CONFIG_FILE}"
+    fi
     [[ -f "$CONFIG_FILE" ]] && cat "$CONFIG_FILE" || info "No config yet at ${CONFIG_FILE}."
+}
+
+# Drops the cached database password for the active profile (all of them
+# with --all), so the next command prompts again.
+cmd_forget() {
+    local all=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --all) all=1; shift ;;
+        *) error_exit "forget: unknown flag: $1" ;;
+    esac; done
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] || { info "Nothing cached (no XDG_RUNTIME_DIR)."; return; }
+    local dir="${XDG_RUNTIME_DIR}/nordrassil"
+    if [[ "$all" -eq 1 ]]; then
+        rm -f "${dir}"/*.dbpass 2>/dev/null || true
+        success "Forgot every cached database password."
+    else
+        rm -f "${dir}/${PROFILE:-default}.dbpass" 2>/dev/null || true
+        success "Forgot the cached database password for ${PROFILE:-default}."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# apply-sql — run a .sql file against one of the server's databases.
+#
+# The thing 'configure' cannot do: apply a customization to a server that is
+# already running, wherever it runs. It goes through _db_client_stdin, so it
+# works over every transport and across ssh without knowing which is in use.
+#
+# Tracked by CONTENT, not by filename: the record is
+# sql:<basename>@<sha256 prefix>, so re-running an unchanged file is a no-op
+# while an edited one applies again on its own. Name-only tracking would mean
+# passing --force after every edit, which for a file being iterated on is the
+# wrong default.
+#
+# NOT atomic. DDL in MySQL/MariaDB is not transactional, so a file that fails
+# halfway leaves whatever ran before the failure in place. The client stops at
+# the first error and the applied record is only written on success, so a
+# failed run is never recorded as done.
+# -----------------------------------------------------------------------------
+
+cmd_apply_sql() {
+    header "nordrassil — Apply SQL"
+    _settings
+
+    local file="" db="" force=0 record=1
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --file)      file="$2"; shift 2 ;;
+        --db)        db="$2"; shift 2 ;;
+        --force)     force=1; shift ;;
+        --no-record) record=0; shift ;;
+        *) error_exit "apply-sql: unknown flag: $1" ;;
+    esac; done
+
+    [[ -n "$file" ]] || error_exit "apply-sql: --file is required."
+    file="${file/#\~/$HOME}"
+    [[ -f "$file" && -r "$file" ]] || error_exit "apply-sql: cannot read ${file}."
+    [[ -s "$file" ]] || error_exit "apply-sql: ${file} is empty."
+    [[ -n "$db" ]] || error_exit "apply-sql: --db is required (mangos|characters|realmd|logs)."
+    # Spliced into SQL as an identifier, where quoting would not help, so the
+    # name is restricted instead.
+    [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || error_exit "apply-sql: --db '${db}' is not a valid database name."
+
+    _db_require || return 1
+
+    local sum name
+    sum="$(sha256sum "$file" | cut -c1-12)"
+    name="sql:$(basename "$file")@${sum}"
+
+    info "file:     ${file}"
+    info "database: ${db}"
+    info "record:   ${name}"
+
+    # Checked up front: a missing database makes the client report "Unknown
+    # database" once per statement, which reads like a problem with the file.
+    local exists
+    exists="$(_db_query_raw "SHOW DATABASES LIKE '$(_sql_escape "$db")';" 2>/dev/null)" || exists=""
+    [[ -n "$exists" ]] || error_exit "apply-sql: database '${db}' does not exist on this server."
+
+    if [[ "$record" -eq 1 ]]; then
+        # The tracking table belongs to 'configure', but a server bootstrapped
+        # by something else (kuat's own db-init, say) will not have it, and
+        # apply-sql is exactly the command such a server needs.
+        _db_exec "CREATE TABLE IF NOT EXISTS realmd.nordrassil_applied (name VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);" >/dev/null \
+            || error_exit "apply-sql: could not create the tracking table realmd.nordrassil_applied."
+        if _db_is_applied "$name"; then
+            if [[ "$force" -eq 0 ]]; then
+                success "Already applied, identical content — nothing to do (--force applies it again)."
+                return 0
+            fi
+            warn "Already applied; --force given, applying again."
+        fi
+    fi
+
+    _db_import "$db" "$file" || error_exit "apply-sql: ${file} failed against ${db} — nothing recorded."
+    [[ "$record" -eq 1 ]] && _db_mark_applied "$name"
+    success "Applied $(basename "$file") to ${db}."
+}
+
+# -----------------------------------------------------------------------------
+# restart — bring the server back, wherever it runs.
+#
+# Two ways, because they fail differently:
+#
+#   default      restart at the orchestrator (container restart, or deleting
+#                the pod). Deterministic: it does not need mangosd to be
+#                healthy enough to read its console.
+#   --graceful   ask mangosd itself to restart in N seconds. Players are
+#                warned and the world is saved, but it needs a working
+#                console, and nothing happens if the server is already wedged.
+#
+# Either way nothing here starts it again: the container's restart policy
+# does that (a Deployment's is always Always; run-docker uses
+# --restart unless-stopped).
+#
+# N IS NOT HOW LONG THE RESTART TAKES. It is how long mangosd waits before
+# stopping; coming back then depends on the supervisor noticing it stopped.
+# Measured on a k8s deployment where mangosd and realmd share a container:
+# mangosd stopped on schedule, but the container kept running until the
+# liveness probe failed three times (30s period => ~90s) and kubelet sent
+# TERM, so a 15s graceful restart took about 95s end to end. The default
+# path has no such dependency, which is why it is the default.
+# -----------------------------------------------------------------------------
+
+cmd_restart() {
+    header "nordrassil — Restart"
+    _settings
+
+    local graceful=0 delay=30
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --graceful) graceful=1; shift
+                    # An optional count follows: 'restart --graceful 60'.
+                    if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then delay="$1"; shift; fi ;;
+        --where)    WHERE="$2"; shift 2 ;;
+        *) error_exit "restart: unknown flag: $1" ;;
+    esac; done
+
+    local target
+    target=$(_server_transport) || return 1
+
+    if [[ "$graceful" -eq 1 ]]; then
+        info "Asking mangosd to restart in ${delay}s; players are warned and the world is saved."
+        _send_console_cmd "$target" "server restart ${delay}" || return 1
+        success "Restart scheduled (${target}): mangosd stops in ${delay}s."
+        info "It comes back when the supervisor notices it stopped — with probes in"
+        info "front of it that can be well after ${delay}s. 'server shutdown cancel'"
+        info "on the console aborts the scheduled stop."
+        return 0
+    fi
+
+    case "$target" in
+        local)
+            cmd_stop
+            cmd_start
+            ;;
+        docker|podman)
+            if [[ -z "$SERVER_SSH_HOST" ]]; then
+                "$target" restart "$SERVER_CONTAINER_NAME" >/dev/null \
+                    || error_exit "restart: '${target} restart ${SERVER_CONTAINER_NAME}' failed."
+            else
+                _remote_run "$SERVER_SSH_HOST" "$target" restart "$SERVER_CONTAINER_NAME" </dev/null >/dev/null \
+                    || error_exit "restart: '${target} restart ${SERVER_CONTAINER_NAME}' failed on ${SERVER_SSH_HOST}."
+            fi
+            success "Restarted container ${SERVER_CONTAINER_NAME}."
+            ;;
+        kubectl)
+            local pod
+            pod="$(_kube_pick_pod "$SERVER_POD_SELECTOR" "$SERVER_SSH_HOST")" || return 1
+            # Deleting the pod, NOT `kubectl rollout restart`.
+            #
+            # Deleting a pod changes no manifest, so a GitOps controller has
+            # nothing to disagree with: the ReplicaSet simply makes another
+            # one. Verified against Argo CD with selfHeal enabled — the
+            # Application stayed Synced/Healthy across the restart and no
+            # annotation was left on the pod template.
+            #
+            # rollout restart would instead stamp
+            # kubectl.kubernetes.io/restartedAt into the Deployment's pod
+            # template, i.e. change the live object away from git. The
+            # expectation is that self-healing then reverts it and each write
+            # rolls the pods again — but that is reasoning about selfHeal, NOT
+            # something measured here, so it is a reason to prefer the delete
+            # rather than a documented failure.
+            info "Deleting pod ${pod}; its controller replaces it (no manifest change, so GitOps has nothing to revert)."
+            _kube "$SERVER_SSH_HOST" delete pod -n "$K8S_NAMESPACE" "$pod" </dev/null \
+                || error_exit "restart: deleting pod ${pod} failed."
+            success "Pod ${pod} deleted; its replacement is starting."
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# dump / restore — back up and put back, over whatever transport is in use.
+#
+# Both go through the same client machinery as everything else, so a dump of a
+# remote cluster's database and a dump of a local container are the same
+# command with a different profile.
+#
+# The dump carries CREATE DATABASE/USE (mariadb-dump --databases), so it is
+# self-describing and restore does not have to be told where it goes.
+# -----------------------------------------------------------------------------
+
+cmd_dump() {
+    header "nordrassil — Dump"
+    _settings
+
+    local db="" all=0 out="" gz=1 tables=""
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --db)      db="$2"; shift 2 ;;
+        --tables)  tables="$2"; shift 2 ;;
+        --all)     all=1; shift ;;
+        --out)     out="$2"; shift 2 ;;
+        --no-gzip) gz=0; shift ;;
+        *) error_exit "dump: unknown flag: $1" ;;
+    esac; done
+
+    [[ "$all" -eq 1 || -n "$db" ]] || error_exit "dump: pass --all or --db NAME (${NORDRASSIL_DBS[*]})."
+    [[ "$all" -eq 1 && -n "$db" ]] && error_exit "dump: --all and --db are mutually exclusive."
+    [[ -n "$tables" && "$all" -eq 1 ]] && error_exit "dump: --tables needs a single --db, not --all."
+    [[ -n "$tables" && -z "$db" ]] && error_exit "dump: --tables also needs --db NAME."
+
+    local -a dbs
+    if [[ "$all" -eq 1 ]]; then
+        dbs=( "${NORDRASSIL_DBS[@]}" )
+    else
+        [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || error_exit "dump: --db '${db}' is not a valid database name."
+        dbs=( "$db" )
+    fi
+
+    _db_require || return 1
+
+    # Each database is checked before anything is written: mariadb-dump on a
+    # missing one fails only after emitting part of its output, which would
+    # leave a file that looks like a dump and is not one.
+    local d exists
+    for d in "${dbs[@]}"; do
+        exists="$(_db_query_raw "SHOW DATABASES LIKE '$(_sql_escape "$d")';" 2>/dev/null)" || exists=""
+        [[ -n "$exists" ]] || error_exit "dump: database '${d}' does not exist on this server."
+    done
+
+    # Named tables are checked to exist for the same reason the databases are:
+    # mariadb-dump on a missing one fails only after emitting output.
+    local -a tbl=()
+    if [[ -n "$tables" ]]; then
+        local t
+        # shellcheck disable=SC2206
+        for t in $tables; do
+            [[ "$t" =~ ^[A-Za-z0-9_]+$ ]] || error_exit "dump: '${t}' is not a valid table name."
+            [[ -n "$(_db_query_raw "SHOW TABLES FROM \`${db}\` LIKE '$(_sql_escape "$t")';" 2>/dev/null)" ]] \
+                || error_exit "dump: table '${db}.${t}' does not exist."
+            tbl+=( "$t" )
+        done
+        [[ ${#tbl[@]} -gt 0 ]] || error_exit "dump: --tables was empty."
+    fi
+
+    if [[ -z "$out" ]]; then
+        local what; if [[ "$all" -eq 1 ]]; then what="all"; elif [[ -n "$tables" ]]; then what="${db}-tables"; else what="$db"; fi
+        out="${DUMP_DIR}/${PROFILE:-default}-${what}-$(date +%Y%m%d-%H%M%S).sql"
+        [[ "$gz" -eq 1 ]] && out="${out}.gz"
+    fi
+    out="${out/#\~/$HOME}"
+    mkdir -p "$(dirname "$out")"
+
+    info "databases: ${dbs[*]}"
+    info "output:    ${out}"
+
+    # --single-transaction: a consistent snapshot without locking out writers.
+    # --events --routines: realmd ships an event, and a backup that silently
+    #   drops schema objects is not a backup. Restoring them can need
+    #   elevated privileges — see restore.
+    local -a dargs
+    if [[ ${#tbl[@]} -gt 0 ]]; then
+        # A table list means no --databases, so the dump carries no CREATE
+        # DATABASE or USE and is NOT self-describing: restore has to be told
+        # --db. That is the point of it — the whole reason to dump a subset is
+        # usually to leave the rest of the target database alone, and a dump
+        # that named its own database could not do that.
+        #
+        # --events/--routines are database-level and meaningless here.
+        dargs=( --single-transaction --quick "$db" "${tbl[@]}" )
+        info "tables:    ${tbl[*]}"
+        info "note:      a table dump names no database — restore it with --db ${db}"
+    else
+        dargs=( --single-transaction --quick --events --routines --databases "${dbs[@]}" )
+    fi
+
+    # Written to .partial and renamed only on success, so a dump that fails
+    # halfway is never left looking like a usable backup. pipefail (set at the
+    # top of this script) is what makes the gzip branch notice a mariadb-dump
+    # failure instead of reporting gzip's own happy exit.
+    local tmp="${out}.partial"
+    rm -f "$tmp"
+    if [[ "$gz" -eq 1 ]]; then
+        _db_dump "${dargs[@]}" | gzip -c >"$tmp" || { rm -f "$tmp"; error_exit "dump: failed — nothing written."; }
+    else
+        _db_dump "${dargs[@]}" >"$tmp" || { rm -f "$tmp"; error_exit "dump: failed — nothing written."; }
+    fi
+    [[ -s "$tmp" ]] || { rm -f "$tmp"; error_exit "dump: produced an empty file."; }
+    mv -f "$tmp" "$out"
+
+    success "Dumped ${dbs[*]} to ${out} ($(du -h "$out" | cut -f1))."
+}
+
+cmd_restore() {
+    header "nordrassil — Restore"
+    _settings
+
+    local file="" db="" yes=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --file) file="$2"; shift 2 ;;
+        --db)   db="$2"; shift 2 ;;
+        --yes)  yes=1; shift ;;
+        *) error_exit "restore: unknown flag: $1" ;;
+    esac; done
+
+    [[ -n "$file" ]] || error_exit "restore: --file is required."
+    file="${file/#\~/$HOME}"
+    [[ -f "$file" && -r "$file" ]] || error_exit "restore: cannot read ${file}."
+    [[ -s "$file" ]] || error_exit "restore: ${file} is empty."
+    [[ -z "$db" || "$db" =~ ^[A-Za-z0-9_]+$ ]] || error_exit "restore: --db '${db}' is not a valid database name."
+
+    # gzip detected by CONTENT, not by extension: a .sql that is really
+    # gzipped, or a .gz that is not, would otherwise be fed to the client as
+    # garbage and fail with a parse error halfway through.
+    local reader=cat
+    if [[ "$(head -c2 "$file" | od -An -tx1 | tr -d ' \n')" == "1f8b" ]]; then
+        command -v gzip &>/dev/null || error_exit "restore: ${file} is gzipped and gzip is not installed."
+        reader="gzip -dc"
+    fi
+
+    # Checked before handing the file to a client that can write everywhere.
+    local head_txt
+    # shellcheck disable=SC2086
+    head_txt="$($reader "$file" 2>/dev/null | head -40)" || true
+    grep -qiE 'mysql dump|mariadb dump|^CREATE |^INSERT |^USE ' <<<"$head_txt" \
+        || error_exit "restore: ${file} does not look like a SQL dump (no header, CREATE, INSERT or USE in its first 40 lines)."
+
+    # Which databases this will overwrite, read out of the dump itself rather
+    # than assumed, so the warning names what actually happens.
+    local targets=""
+    if [[ -n "$db" ]]; then
+        targets="$db (forced with --db)"
+    else
+        # shellcheck disable=SC2086
+        targets="$($reader "$file" 2>/dev/null \
+                   | grep -oiE '^(CREATE DATABASE[^`]*`|USE `)[^`]+`' \
+                   | grep -oE '`[^`]+`$' | tr -d '`' | sort -u | tr '\n' ' ')" || targets=""
+    fi
+    [[ -n "${targets// /}" ]] || error_exit "restore: the dump names no database — pass --db NAME to say where it goes."
+
+    info "file:   ${file}"
+    info "reader: ${reader}"
+    warn "OVERWRITES: ${targets}"
+
+    [[ "$yes" -eq 1 ]] || error_exit "restore: refusing without --yes. This REPLACES the data in: ${targets}"
+
+    _db_require || return 1
+
+    # A running mangosd caches world data and holds character state in
+    # memory, so after a restore it disagrees with its own database until it
+    # is restarted. Not fatal, and some restores are deliberately done live,
+    # but it is never not worth saying.
+    warn "A running server caches world and character data — run 'restart' afterwards."
+
+    # shellcheck disable=SC2086
+    if [[ -n "$db" ]]; then
+        $reader "$file" | _db_client_stdin "$db" || error_exit "restore: failed applying ${file} to ${db}."
+    else
+        $reader "$file" | _db_client_stdin || error_exit "restore: failed applying ${file}."
+    fi
+    success "Restored ${file} into ${targets}"
+    info "Now: nordrassil.sh ${PROFILE:+--profile ${PROFILE} }restart"
+}
+
+# Lists the profiles in PROFILE_DIR, marking the active one.
+cmd_profiles() {
+    [[ -d "$PROFILE_DIR" ]] || { info "No profiles yet. Create one with: --profile NAME set KEY VALUE"; return; }
+    local f name found=0
+    for f in "$PROFILE_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        name="$(basename "$f" .conf)"
+        if [[ "$name" == "$PROFILE" ]]; then
+            printf '* %s\n' "$name"
+        else
+            printf '  %s\n' "$name"
+        fi
+        found=1
+    done
+    [[ "$found" -eq 1 ]] || info "No profiles yet. Create one with: --profile NAME set KEY VALUE"
 }
 
 # Lists the Custom SQL files available to 'configure --custom' (basenames, no
@@ -2034,11 +2868,12 @@ usage() {
     cat >&2 <<'EOF'
 nordrassil — VMaNGOS vanilla WoW (1.12.1) server engine
 
-Usage: nordrassil.sh [--context CTX | --kind CLUSTER] <command> [flags]
+Usage: nordrassil.sh [--profile NAME] [--context CTX | --kind CLUSTER] <command> [flags]
 
 Global flags (kube target for run-k8s/stop-k8s):
   --context CTX        use kube-context CTX
   --kind CLUSTER       use kind cluster CLUSTER (context kind-CLUSTER; side-loads the image)
+  --profile NAME       use the profile NAME (see Profiles below)
 
 Setup / local:
   install-deps
@@ -2062,21 +2897,108 @@ Accounts:
 Characters:
   rename-character --from OLD --to NEW
 
+Administration:
+  apply-sql --file PATH --db NAME [--force] [--no-record]
+                                  run a .sql file against one database.
+                                  Tracked by content hash, so re-running an
+                                  unchanged file does nothing and an edited
+                                  one applies again.
+  restart [--graceful [SECS]] [--where ...]
+                                  restart at the orchestrator (default), or
+                                  ask mangosd to restart in SECS, warning
+                                  players and saving the world first.
+  dump --all | --db NAME [--tables "a b c"] [--out PATH] [--no-gzip]
+                                  gzipped SQL to ~/.config/nordrassil/dumps
+                                  by default. Carries CREATE DATABASE, so a
+                                  restore needs no --db — except with
+                                  --tables, which dumps a subset and must be
+                                  restored with --db.
+  restore --file PATH --yes [--db NAME]
+                                  DESTRUCTIVE: replaces the data in whichever
+                                  databases the dump names. gzip is detected
+                                  by content. --yes is required.
+
 Search:
   search --kind items|npcs|teleports|characters --term TERM
 
 Config store (used by the scomp-link front-end):
   set KEY VALUE | get KEY | config | list-custom
 
+Transports (where this script looks for the server and the database):
+  Two independent settings, because they need not be in the same place — a
+  server can run in k8s while its database runs under podman on the host.
+
+  set DB_TRANSPORT      auto | docker | podman | kubectl | tcp
+  set SERVER_TRANSPORT  auto | local  | docker | podman  | kubectl
+
+  'auto' probes the local container, then the cluster, then TCP. Supporting
+  settings, each of which used to be hardcoded:
+
+  set DB_HOST / DB_PORT        the tcp transport's endpoint
+  set DB_POD_SELECTOR          default app=vanilla-wow-mariadb
+  set SERVER_POD_SELECTOR      default app=vanilla-wow-server
+  set SERVER_K8S_CONTAINER     container in the pod (empty = kubectl picks)
+  set SERVER_FIFO              mangosd's console FIFO inside the container
+                               (default /app/mangosd.stdin)
+
+  SSH is a third, orthogonal axis — it says WHERE the orchestrator runs,
+  not which one, so remote k8s needs no kubectl on this machine:
+
+  set DB_SSH_HOST / SERVER_SSH_HOST    empty = local; needs key-based ssh
+
+  With an ssh host set, the transport must be explicit: 'auto' will not
+  probe across a network. tcp needs a mariadb client here.
+  --where still selects between several running servers.
+
+Profiles (one per server):
+  --profile NAME <command>        or $NORDRASSIL_PROFILE
+  profiles                        list them, marking the active one
+  forget [--all]                  drop the cached database password
+
+  A profile is $CONFIG_DIR/profiles/NAME.conf, layered OVER nordrassil.conf:
+  a key present in the profile wins, anything absent falls through. So
+  shared settings stay in one place and a profile carries only what differs.
+  'set' writes to the active profile, or to the base file when none is.
+
+  DB_PASS=ask prompts once per session per profile, cached in
+  $XDG_RUNTIME_DIR (tmpfs, 0600, gone on logout). 'forget' clears it.
+
+  set MANAGED_EXTERNALLY 1     this server is provisioned by something else
+                               (Ansible, GitOps, CI). configure, build-image,
+                               run-docker, stop-docker, run-k8s, stop-k8s,
+                               start, stop and edit are then REFUSED;
+                               accounts, characters, search, apply-sql, dump,
+                               restore, restart and status still work.
+                               Mainly it stops 'configure' re-running the
+                               world import over live data.
+
+  A worked example — k8s server on another host, its MariaDB in podman
+  beside it, driven from a machine with neither kubectl nor the password:
+
+    --profile meksha set DB_TRANSPORT podman
+    --profile meksha set DB_SSH_HOST meksha
+    --profile meksha set DB_CONTAINER_NAME mariadb
+    --profile meksha set DB_PASS ask
+    --profile meksha set SERVER_TRANSPORT kubectl
+    --profile meksha set SERVER_SSH_HOST meksha
+    --profile meksha set K8S_NAMESPACE azeroth
+    --profile meksha set SERVER_POD_SELECTOR app=azeroth
+    --profile meksha set SERVER_K8S_CONTAINER azeroth
+    --profile meksha set SERVER_FIFO /opt/azeroth/mangosd.stdin
+
   help | -h | --help
 EOF
 }
 
 main() {
-    # Global flags first (kube target), then the subcommand.
+    # $NORDRASSIL_PROFILE first so an explicit --profile can still override it.
+    [[ -n "$PROFILE" ]] && _profile_activate "$PROFILE"
+
+    # Global flags first (kube target, profile), then the subcommand.
     while [[ $# -gt 0 ]]; do case "$1" in
         --context) KUBE_CONTEXT="$2"; shift 2 ;;
         --kind)    KIND_CLUSTER="$2"; shift 2 ;;
+        --profile) _profile_activate "$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         --) shift; break ;;
         -*) error_exit "Unknown global flag: $1" ;;
@@ -2099,6 +3021,10 @@ main() {
         set-account-level)  cmd_set_account_level "$@" ;;
         rename-character)   cmd_rename_character "$@" ;;
         search)             cmd_search "$@" ;;
+        apply-sql)          cmd_apply_sql "$@" ;;
+        restart)            cmd_restart "$@" ;;
+        dump)               cmd_dump "$@" ;;
+        restore)            cmd_restore "$@" ;;
         build-image)        cmd_build_image "$@" ;;
         run-docker)         cmd_run_docker "$@" ;;
         stop-docker)        cmd_stop_docker "$@" ;;
@@ -2108,6 +3034,8 @@ main() {
         get)                cmd_get "$@" ;;
         config)             cmd_config "$@" ;;
         list-custom)        cmd_list_custom "$@" ;;
+        profiles)           cmd_profiles "$@" ;;
+        forget)             cmd_forget "$@" ;;
         -h|--help|help)     usage ;;
         *) error_exit "Unknown command: $cmd (run with --help for usage)" ;;
     esac

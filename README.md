@@ -70,6 +70,7 @@ of Dockerfile / entrypoint / k8s manifests / source patches). No `gum`, no
 | --- | --- |
 | `--context CTX` | use kube-context `CTX` |
 | `--kind CLUSTER` | use kind cluster `CLUSTER` (context `kind-CLUSTER`; side-loads the image) |
+| `--profile NAME` | use the profile `NAME` (see [Profiles](#profiles)); also `$NORDRASSIL_PROFILE` |
 
 Neither given ⇒ the current kube context.
 
@@ -103,6 +104,16 @@ Search
 
 Config store
   set KEY VALUE | get KEY | config | list-custom
+
+Administration
+  apply-sql --file PATH --db NAME [--force] [--no-record]
+  restart [--graceful [SECS]] [--where ...]
+  dump --all | --db NAME [--out PATH] [--no-gzip]
+  restore --file PATH --yes [--db NAME]
+
+Profiles
+  profiles                        list profiles, marking the active one
+  forget [--all]                  drop the cached database password
 
 help | -h | --help
 ```
@@ -149,11 +160,164 @@ Things worth knowing:
 ./nordrassil.sh rename-character --from Leeroy --to Jenkins
 ```
 
+## Administration
+
+`apply-sql` runs a `.sql` file against one database, over whatever transport
+the profile names — so the same command works on a local container and on a
+remote cluster. It is the thing `configure` cannot do: apply a customization
+to a server that is already running.
+
+It is tracked **by content**, not filename. The record is
+`sql:<basename>@<sha256 prefix>` in `realmd.nordrassil_applied`, so re-running
+an unchanged file is a no-op while an edited one applies again on its own;
+`--force` applies regardless, `--no-record` skips the bookkeeping. A file that
+fails is never recorded, so fixing it and re-running is the normal path.
+
+Not atomic — DDL in MariaDB is not transactional, so a file that fails halfway
+leaves what already ran in place. The client stops at the first error.
+
+```sh
+./nordrassil.sh --profile meksha apply-sql --file ./my-change.sql --db mangos
+```
+
+`restart` has two modes, which fail differently:
+
+| | |
+| --- | --- |
+| default | restart at the orchestrator — container restart, or deleting the pod. Deterministic: does not need mangosd healthy enough to read its console. |
+| `--graceful [SECS]` | ask mangosd to restart in `SECS`, warning players and saving the world first. Needs a working console. |
+
+Neither mode starts the server again itself; the container's restart policy
+does that. Deleting the pod is deliberate rather than `kubectl rollout
+restart`: a delete changes no manifest, so a GitOps controller has nothing to
+revert — verified against Argo CD with self-healing on, which stayed
+`Synced/Healthy` across a restart.
+
+**`SECS` is not how long the restart takes.** It is how long mangosd waits
+before stopping; coming back depends on the supervisor noticing. On a k8s
+deployment where mangosd and realmd share a container, mangosd stopped on
+schedule but the container ran on until the liveness probe failed three times
+(~90s) and kubelet sent `TERM` — so `--graceful 15` took about 95s end to end.
+The default path has no such dependency.
+
+### Dump and restore
+
+`dump` writes gzipped SQL to `~/.config/nordrassil/dumps` by default. Because
+it uses `mariadb-dump --databases`, the dump carries `CREATE DATABASE`/`USE`
+and is **self-describing** — `restore` reads its targets out of the file and
+needs no `--db`.
+
+`--single-transaction` gives a consistent snapshot without locking out
+writers. `--events --routines` are included because `realmd` ships an event
+and a backup that silently drops schema objects is not a backup; restoring
+those can need elevated privileges, so restore as a user that has them
+(`root`, normally).
+
+A failed dump is written to `.partial` and renamed only on success, so there
+is never a truncated file sitting there looking like a backup.
+
+`restore` is destructive and says so: it prints the databases it will
+overwrite — read from the dump, not assumed — and **refuses without `--yes`**.
+gzip is detected by content rather than by extension, so a mislabelled file
+still works. It also checks the file looks like a SQL dump before handing it
+to a client that can write everywhere.
+
+```sh
+./nordrassil.sh dump --all                       # all four, local
+./nordrassil.sh --profile meksha dump --db mangos
+./nordrassil.sh --profile meksha restore --file dumps/default-all-....sql.gz --yes
+./nordrassil.sh --profile meksha restart         # a running server caches data
+```
+
+Because the transport comes from the profile, a dump taken from one server
+restores onto another with nothing but a different `--profile` — which is how
+you move a world between the two.
+
+## Transports
+
+Reaching the **database** and reaching **mangosd** are separate questions, and
+a deployment need not answer them the same way — a server can run as a k8s
+Deployment while its MariaDB runs in podman on the host beside it. Two
+independent settings, so no single value has to describe the whole stack:
+
+| | Values |
+| --- | --- |
+| `DB_TRANSPORT` | `auto` \| `docker` \| `podman` \| `kubectl` \| `tcp` |
+| `SERVER_TRANSPORT` | `auto` \| `local` \| `docker` \| `podman` \| `kubectl` |
+
+`auto` probes the local container, then the cluster, then a TCP endpoint, which
+is what this script did before the two were separable.
+
+**SSH is a third, orthogonal axis.** `DB_SSH_HOST` / `SERVER_SSH_HOST` say
+*where the orchestrator runs*, not which one — so administering a remote
+cluster needs no `kubectl` on the machine you are sitting at, and a remote
+podman container needs no published port. Remoteness multiplies nothing:
+nothing about reaching a container engine changes because it is on another
+host. With an ssh host set the transport must be explicit; `auto` will not
+probe across a network. Every ssh call is `BatchMode`, so key-based auth only.
+
+## Profiles
+
+A profile is one server. `~/.config/nordrassil/profiles/NAME.conf`, layered
+**over** `nordrassil.conf`: a key present in the profile wins, anything absent
+falls through to the base file. Shared settings stay in one place and a profile
+carries only what actually differs. `set` writes to the active profile, or to
+the base file when none is active.
+
+`DB_PASS=ask` prompts **once per session, per profile**. The answer is cached
+in `$XDG_RUNTIME_DIR` — tmpfs, mode `0600`, gone on logout — so it is never
+written to a persistent file; with no `$XDG_RUNTIME_DIR` it simply prompts
+every time. `forget` clears it.
+
+### Servers this tool does not own
+
+`MANAGED_EXTERNALLY=1` marks a profile as describing a server that something
+else provisions — Ansible, a GitOps controller, a CI pipeline. The commands
+that create, destroy or re-bootstrap a server are then refused:
+
+> `configure`, `build-image`, `run-docker`, `stop-docker`, `run-k8s`,
+> `stop-k8s`, `start`, `stop`, `edit`
+
+Everything that *administers* one still works: accounts, characters, search,
+`apply-sql`, `dump`, `restore`, `restart`, `status`.
+
+The dangerous one is not a deploy command. `configure` re-runs the world
+import, and on a database this script did not bootstrap — no marker directory,
+`realmd.account` already present — the import bookkeeping finds no state,
+says so, and lets every import run again, over live data. `run-k8s` applying
+this project's own manifests into a namespace a controller already owns is
+the more obvious hazard but the less costly one.
+
+The flag is validated strictly rather than tested for truthiness: anything
+that is not exactly `0` or `1` is an error, because the direction that fails
+quietly is a typo reading as "not managed".
+
+A worked example: a k8s server on another host, its MariaDB in podman beside
+it, driven from a machine with neither `kubectl` nor the password on it.
+
+```sh
+./nordrassil.sh --profile meksha set DB_TRANSPORT podman
+./nordrassil.sh --profile meksha set DB_SSH_HOST meksha
+./nordrassil.sh --profile meksha set DB_CONTAINER_NAME mariadb
+./nordrassil.sh --profile meksha set DB_PASS ask
+./nordrassil.sh --profile meksha set SERVER_TRANSPORT kubectl
+./nordrassil.sh --profile meksha set SERVER_SSH_HOST meksha
+./nordrassil.sh --profile meksha set K8S_NAMESPACE azeroth
+./nordrassil.sh --profile meksha set SERVER_POD_SELECTOR app=azeroth
+./nordrassil.sh --profile meksha set SERVER_K8S_CONTAINER azeroth
+./nordrassil.sh --profile meksha set SERVER_FIFO /opt/azeroth/mangosd.stdin
+
+./nordrassil.sh --profile meksha search --kind npcs --term Hogger
+./nordrassil.sh --profile meksha create-account --name bob --pass hunter2
+```
+
 ## Configuration
 
 State lives in `~/.config/nordrassil/nordrassil.conf` (XDG-style, `key=value`,
-one setting per line). Read/write it with `get`/`set`/`config`; commands read it
-back on every run and fall back to sane defaults for anything unset.
+one setting per line), with per-server overrides in
+`~/.config/nordrassil/profiles/NAME.conf` (see [Profiles](#profiles)).
+Read/write it with `get`/`set`/`config`; commands read it back on every run and
+fall back to sane defaults for anything unset.
 
 | Key | Default | Notes |
 | --- | --- | --- |
@@ -177,6 +341,12 @@ back on every run and fall back to sane defaults for anything unset.
 | `K8S_STORAGE_TYPE` | `hostpath` | `hostpath` \| `storageclass` |
 | `K8S_DATA_HOSTPATH` / `K8S_DB_HOSTPATH` | `$SOURCE_DIR/data` / `/var/vanilla-wow-mariadb` | hostPath backing |
 | `K8S_STORAGECLASS` | (empty) | StorageClass name (empty = cluster default) |
+| `DB_TRANSPORT` / `SERVER_TRANSPORT` | `auto` / `auto` | see [Transports](#transports) |
+| `DB_SSH_HOST` / `SERVER_SSH_HOST` | (empty) | empty = local; otherwise run the orchestrator there over ssh |
+| `DB_POD_SELECTOR` | `app=vanilla-wow-mariadb` | label selector for the MariaDB pod |
+| `SERVER_POD_SELECTOR` | `app=vanilla-wow-server` | label selector for the mangosd pod |
+| `SERVER_K8S_CONTAINER` | (empty) | container in that pod; empty lets kubectl choose (and print "Defaulted container…") |
+| `SERVER_FIFO` | `/app/mangosd.stdin` | mangosd's console FIFO **inside** the container |
 
 ## Credits
 
