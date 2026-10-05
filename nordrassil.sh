@@ -2659,9 +2659,10 @@ cmd_dump() {
     header "nordrassil — Dump"
     _settings
 
-    local db="" all=0 out="" gz=1
+    local db="" all=0 out="" gz=1 tables=""
     while [[ $# -gt 0 ]]; do case "$1" in
         --db)      db="$2"; shift 2 ;;
+        --tables)  tables="$2"; shift 2 ;;
         --all)     all=1; shift ;;
         --out)     out="$2"; shift 2 ;;
         --no-gzip) gz=0; shift ;;
@@ -2670,6 +2671,8 @@ cmd_dump() {
 
     [[ "$all" -eq 1 || -n "$db" ]] || error_exit "dump: pass --all or --db NAME (${NORDRASSIL_DBS[*]})."
     [[ "$all" -eq 1 && -n "$db" ]] && error_exit "dump: --all and --db are mutually exclusive."
+    [[ -n "$tables" && "$all" -eq 1 ]] && error_exit "dump: --tables needs a single --db, not --all."
+    [[ -n "$tables" && -z "$db" ]] && error_exit "dump: --tables also needs --db NAME."
 
     local -a dbs
     if [[ "$all" -eq 1 ]]; then
@@ -2690,8 +2693,23 @@ cmd_dump() {
         [[ -n "$exists" ]] || error_exit "dump: database '${d}' does not exist on this server."
     done
 
+    # Named tables are checked to exist for the same reason the databases are:
+    # mariadb-dump on a missing one fails only after emitting output.
+    local -a tbl=()
+    if [[ -n "$tables" ]]; then
+        local t
+        # shellcheck disable=SC2206
+        for t in $tables; do
+            [[ "$t" =~ ^[A-Za-z0-9_]+$ ]] || error_exit "dump: '${t}' is not a valid table name."
+            [[ -n "$(_db_query_raw "SHOW TABLES FROM \`${db}\` LIKE '$(_sql_escape "$t")';" 2>/dev/null)" ]] \
+                || error_exit "dump: table '${db}.${t}' does not exist."
+            tbl+=( "$t" )
+        done
+        [[ ${#tbl[@]} -gt 0 ]] || error_exit "dump: --tables was empty."
+    fi
+
     if [[ -z "$out" ]]; then
-        local what; if [[ "$all" -eq 1 ]]; then what="all"; else what="$db"; fi
+        local what; if [[ "$all" -eq 1 ]]; then what="all"; elif [[ -n "$tables" ]]; then what="${db}-tables"; else what="$db"; fi
         out="${DUMP_DIR}/${PROFILE:-default}-${what}-$(date +%Y%m%d-%H%M%S).sql"
         [[ "$gz" -eq 1 ]] && out="${out}.gz"
     fi
@@ -2705,7 +2723,21 @@ cmd_dump() {
     # --events --routines: realmd ships an event, and a backup that silently
     #   drops schema objects is not a backup. Restoring them can need
     #   elevated privileges — see restore.
-    local -a dargs=( --single-transaction --quick --events --routines --databases "${dbs[@]}" )
+    local -a dargs
+    if [[ ${#tbl[@]} -gt 0 ]]; then
+        # A table list means no --databases, so the dump carries no CREATE
+        # DATABASE or USE and is NOT self-describing: restore has to be told
+        # --db. That is the point of it — the whole reason to dump a subset is
+        # usually to leave the rest of the target database alone, and a dump
+        # that named its own database could not do that.
+        #
+        # --events/--routines are database-level and meaningless here.
+        dargs=( --single-transaction --quick "$db" "${tbl[@]}" )
+        info "tables:    ${tbl[*]}"
+        info "note:      a table dump names no database — restore it with --db ${db}"
+    else
+        dargs=( --single-transaction --quick --events --routines --databases "${dbs[@]}" )
+    fi
 
     # Written to .partial and renamed only on success, so a dump that fails
     # halfway is never left looking like a usable backup. pipefail (set at the
@@ -2875,10 +2907,12 @@ Administration:
                                   restart at the orchestrator (default), or
                                   ask mangosd to restart in SECS, warning
                                   players and saving the world first.
-  dump --all | --db NAME [--out PATH] [--no-gzip]
+  dump --all | --db NAME [--tables "a b c"] [--out PATH] [--no-gzip]
                                   gzipped SQL to ~/.config/nordrassil/dumps
                                   by default. Carries CREATE DATABASE, so a
-                                  restore needs no --db.
+                                  restore needs no --db — except with
+                                  --tables, which dumps a subset and must be
+                                  restored with --db.
   restore --file PATH --yes [--db NAME]
                                   DESTRUCTIVE: replaces the data in whichever
                                   databases the dump names. gzip is detected
