@@ -2325,6 +2325,175 @@ cmd_forget() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# apply-sql — run a .sql file against one of the server's databases.
+#
+# The thing 'configure' cannot do: apply a customization to a server that is
+# already running, wherever it runs. It goes through _db_client_stdin, so it
+# works over every transport and across ssh without knowing which is in use.
+#
+# Tracked by CONTENT, not by filename: the record is
+# sql:<basename>@<sha256 prefix>, so re-running an unchanged file is a no-op
+# while an edited one applies again on its own. Name-only tracking would mean
+# passing --force after every edit, which for a file being iterated on is the
+# wrong default.
+#
+# NOT atomic. DDL in MySQL/MariaDB is not transactional, so a file that fails
+# halfway leaves whatever ran before the failure in place. The client stops at
+# the first error and the applied record is only written on success, so a
+# failed run is never recorded as done.
+# -----------------------------------------------------------------------------
+
+cmd_apply_sql() {
+    header "nordrassil — Apply SQL"
+    _settings
+
+    local file="" db="" force=0 record=1
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --file)      file="$2"; shift 2 ;;
+        --db)        db="$2"; shift 2 ;;
+        --force)     force=1; shift ;;
+        --no-record) record=0; shift ;;
+        *) error_exit "apply-sql: unknown flag: $1" ;;
+    esac; done
+
+    [[ -n "$file" ]] || error_exit "apply-sql: --file is required."
+    file="${file/#\~/$HOME}"
+    [[ -f "$file" && -r "$file" ]] || error_exit "apply-sql: cannot read ${file}."
+    [[ -s "$file" ]] || error_exit "apply-sql: ${file} is empty."
+    [[ -n "$db" ]] || error_exit "apply-sql: --db is required (mangos|characters|realmd|logs)."
+    # Spliced into SQL as an identifier, where quoting would not help, so the
+    # name is restricted instead.
+    [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || error_exit "apply-sql: --db '${db}' is not a valid database name."
+
+    _db_require || return 1
+
+    local sum name
+    sum="$(sha256sum "$file" | cut -c1-12)"
+    name="sql:$(basename "$file")@${sum}"
+
+    info "file:     ${file}"
+    info "database: ${db}"
+    info "record:   ${name}"
+
+    # Checked up front: a missing database makes the client report "Unknown
+    # database" once per statement, which reads like a problem with the file.
+    local exists
+    exists="$(_db_query_raw "SHOW DATABASES LIKE '$(_sql_escape "$db")';" 2>/dev/null)" || exists=""
+    [[ -n "$exists" ]] || error_exit "apply-sql: database '${db}' does not exist on this server."
+
+    if [[ "$record" -eq 1 ]]; then
+        # The tracking table belongs to 'configure', but a server bootstrapped
+        # by something else (kuat's own db-init, say) will not have it, and
+        # apply-sql is exactly the command such a server needs.
+        _db_exec "CREATE TABLE IF NOT EXISTS realmd.nordrassil_applied (name VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);" >/dev/null \
+            || error_exit "apply-sql: could not create the tracking table realmd.nordrassil_applied."
+        if _db_is_applied "$name"; then
+            if [[ "$force" -eq 0 ]]; then
+                success "Already applied, identical content — nothing to do (--force applies it again)."
+                return 0
+            fi
+            warn "Already applied; --force given, applying again."
+        fi
+    fi
+
+    _db_import "$db" "$file" || error_exit "apply-sql: ${file} failed against ${db} — nothing recorded."
+    [[ "$record" -eq 1 ]] && _db_mark_applied "$name"
+    success "Applied $(basename "$file") to ${db}."
+}
+
+# -----------------------------------------------------------------------------
+# restart — bring the server back, wherever it runs.
+#
+# Two ways, because they fail differently:
+#
+#   default      restart at the orchestrator (container restart, or deleting
+#                the pod). Deterministic: it does not need mangosd to be
+#                healthy enough to read its console.
+#   --graceful   ask mangosd itself to restart in N seconds. Players are
+#                warned and the world is saved, but it needs a working
+#                console, and nothing happens if the server is already wedged.
+#
+# Either way nothing here starts it again: the container's restart policy
+# does that (a Deployment's is always Always; run-docker uses
+# --restart unless-stopped).
+#
+# N IS NOT HOW LONG THE RESTART TAKES. It is how long mangosd waits before
+# stopping; coming back then depends on the supervisor noticing it stopped.
+# Measured on a k8s deployment where mangosd and realmd share a container:
+# mangosd stopped on schedule, but the container kept running until the
+# liveness probe failed three times (30s period => ~90s) and kubelet sent
+# TERM, so a 15s graceful restart took about 95s end to end. The default
+# path has no such dependency, which is why it is the default.
+# -----------------------------------------------------------------------------
+
+cmd_restart() {
+    header "nordrassil — Restart"
+    _settings
+
+    local graceful=0 delay=30
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --graceful) graceful=1; shift
+                    # An optional count follows: 'restart --graceful 60'.
+                    if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then delay="$1"; shift; fi ;;
+        --where)    WHERE="$2"; shift 2 ;;
+        *) error_exit "restart: unknown flag: $1" ;;
+    esac; done
+
+    local target
+    target=$(_server_transport) || return 1
+
+    if [[ "$graceful" -eq 1 ]]; then
+        info "Asking mangosd to restart in ${delay}s; players are warned and the world is saved."
+        _send_console_cmd "$target" "server restart ${delay}" || return 1
+        success "Restart scheduled (${target}): mangosd stops in ${delay}s."
+        info "It comes back when the supervisor notices it stopped — with probes in"
+        info "front of it that can be well after ${delay}s. 'server shutdown cancel'"
+        info "on the console aborts the scheduled stop."
+        return 0
+    fi
+
+    case "$target" in
+        local)
+            cmd_stop
+            cmd_start
+            ;;
+        docker|podman)
+            if [[ -z "$SERVER_SSH_HOST" ]]; then
+                "$target" restart "$SERVER_CONTAINER_NAME" >/dev/null \
+                    || error_exit "restart: '${target} restart ${SERVER_CONTAINER_NAME}' failed."
+            else
+                _remote_run "$SERVER_SSH_HOST" "$target" restart "$SERVER_CONTAINER_NAME" </dev/null >/dev/null \
+                    || error_exit "restart: '${target} restart ${SERVER_CONTAINER_NAME}' failed on ${SERVER_SSH_HOST}."
+            fi
+            success "Restarted container ${SERVER_CONTAINER_NAME}."
+            ;;
+        kubectl)
+            local pod
+            pod="$(_kube_pick_pod "$SERVER_POD_SELECTOR" "$SERVER_SSH_HOST")" || return 1
+            # Deleting the pod, NOT `kubectl rollout restart`.
+            #
+            # Deleting a pod changes no manifest, so a GitOps controller has
+            # nothing to disagree with: the ReplicaSet simply makes another
+            # one. Verified against Argo CD with selfHeal enabled — the
+            # Application stayed Synced/Healthy across the restart and no
+            # annotation was left on the pod template.
+            #
+            # rollout restart would instead stamp
+            # kubectl.kubernetes.io/restartedAt into the Deployment's pod
+            # template, i.e. change the live object away from git. The
+            # expectation is that self-healing then reverts it and each write
+            # rolls the pods again — but that is reasoning about selfHeal, NOT
+            # something measured here, so it is a reason to prefer the delete
+            # rather than a documented failure.
+            info "Deleting pod ${pod}; its controller replaces it (no manifest change, so GitOps has nothing to revert)."
+            _kube "$SERVER_SSH_HOST" delete pod -n "$K8S_NAMESPACE" "$pod" </dev/null \
+                || error_exit "restart: deleting pod ${pod} failed."
+            success "Pod ${pod} deleted; its replacement is starting."
+            ;;
+    esac
+}
+
 # Lists the profiles in PROFILE_DIR, marking the active one.
 cmd_profiles() {
     [[ -d "$PROFILE_DIR" ]] || { info "No profiles yet. Create one with: --profile NAME set KEY VALUE"; return; }
@@ -2366,11 +2535,12 @@ usage() {
     cat >&2 <<'EOF'
 nordrassil — VMaNGOS vanilla WoW (1.12.1) server engine
 
-Usage: nordrassil.sh [--context CTX | --kind CLUSTER] <command> [flags]
+Usage: nordrassil.sh [--profile NAME] [--context CTX | --kind CLUSTER] <command> [flags]
 
 Global flags (kube target for run-k8s/stop-k8s):
   --context CTX        use kube-context CTX
   --kind CLUSTER       use kind cluster CLUSTER (context kind-CLUSTER; side-loads the image)
+  --profile NAME       use the profile NAME (see Profiles below)
 
 Setup / local:
   install-deps
@@ -2394,6 +2564,17 @@ Accounts:
 Characters:
   rename-character --from OLD --to NEW
 
+Administration:
+  apply-sql --file PATH --db NAME [--force] [--no-record]
+                                  run a .sql file against one database.
+                                  Tracked by content hash, so re-running an
+                                  unchanged file does nothing and an edited
+                                  one applies again.
+  restart [--graceful [SECS]] [--where ...]
+                                  restart at the orchestrator (default), or
+                                  ask mangosd to restart in SECS, warning
+                                  players and saving the world first.
+
 Search:
   search --kind items|npcs|teleports|characters --term TERM
 
@@ -2404,8 +2585,8 @@ Transports (where this script looks for the server and the database):
   Two independent settings, because they need not be in the same place — a
   server can run in k8s while its database runs under podman on the host.
 
-  set DB_TRANSPORT      auto | docker | kubectl | tcp
-  set SERVER_TRANSPORT  auto | local  | docker  | kubectl
+  set DB_TRANSPORT      auto | docker | podman | kubectl | tcp
+  set SERVER_TRANSPORT  auto | local  | docker | podman  | kubectl
 
   'auto' probes the local container, then the cluster, then TCP. Supporting
   settings, each of which used to be hardcoded:
@@ -2413,6 +2594,7 @@ Transports (where this script looks for the server and the database):
   set DB_HOST / DB_PORT        the tcp transport's endpoint
   set DB_POD_SELECTOR          default app=vanilla-wow-mariadb
   set SERVER_POD_SELECTOR      default app=vanilla-wow-server
+  set SERVER_K8S_CONTAINER     container in the pod (empty = kubectl picks)
   set SERVER_FIFO              mangosd's console FIFO inside the container
                                (default /app/mangosd.stdin)
 
@@ -2487,6 +2669,8 @@ main() {
         set-account-level)  cmd_set_account_level "$@" ;;
         rename-character)   cmd_rename_character "$@" ;;
         search)             cmd_search "$@" ;;
+        apply-sql)          cmd_apply_sql "$@" ;;
+        restart)            cmd_restart "$@" ;;
         build-image)        cmd_build_image "$@" ;;
         run-docker)         cmd_run_docker "$@" ;;
         stop-docker)        cmd_stop_docker "$@" ;;

@@ -105,6 +105,10 @@ Search
 Config store
   set KEY VALUE | get KEY | config | list-custom
 
+Administration
+  apply-sql --file PATH --db NAME [--force] [--no-record]
+  restart [--graceful [SECS]] [--where ...]
+
 Profiles
   profiles                        list profiles, marking the active one
   forget [--all]                  drop the cached database password
@@ -153,6 +157,46 @@ Things worth knowing:
 ./nordrassil.sh create-account --name admin --pass secret --level 3
 ./nordrassil.sh rename-character --from Leeroy --to Jenkins
 ```
+
+## Administration
+
+`apply-sql` runs a `.sql` file against one database, over whatever transport
+the profile names — so the same command works on a local container and on a
+remote cluster. It is the thing `configure` cannot do: apply a customization
+to a server that is already running.
+
+It is tracked **by content**, not filename. The record is
+`sql:<basename>@<sha256 prefix>` in `realmd.nordrassil_applied`, so re-running
+an unchanged file is a no-op while an edited one applies again on its own;
+`--force` applies regardless, `--no-record` skips the bookkeeping. A file that
+fails is never recorded, so fixing it and re-running is the normal path.
+
+Not atomic — DDL in MariaDB is not transactional, so a file that fails halfway
+leaves what already ran in place. The client stops at the first error.
+
+```sh
+./nordrassil.sh --profile meksha apply-sql --file ./my-change.sql --db mangos
+```
+
+`restart` has two modes, which fail differently:
+
+| | |
+| --- | --- |
+| default | restart at the orchestrator — container restart, or deleting the pod. Deterministic: does not need mangosd healthy enough to read its console. |
+| `--graceful [SECS]` | ask mangosd to restart in `SECS`, warning players and saving the world first. Needs a working console. |
+
+Neither mode starts the server again itself; the container's restart policy
+does that. Deleting the pod is deliberate rather than `kubectl rollout
+restart`: a delete changes no manifest, so a GitOps controller has nothing to
+revert — verified against Argo CD with self-healing on, which stayed
+`Synced/Healthy` across a restart.
+
+**`SECS` is not how long the restart takes.** It is how long mangosd waits
+before stopping; coming back depends on the supervisor noticing. On a k8s
+deployment where mangosd and realmd share a container, mangosd stopped on
+schedule but the container ran on until the liveness probe failed three times
+(~90s) and kubelet sent `TERM` — so `--graceful 15` took about 95s end to end.
+The default path has no such dependency.
 
 ## Transports
 
