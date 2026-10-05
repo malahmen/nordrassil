@@ -1641,6 +1641,27 @@ _kube_mariadb() {
     fi
 }
 
+# _db_report <what> <sql> — run a human-facing query and SAY SO when it
+# matches nothing.
+#
+# The mariadb client prints absolutely nothing for an empty result set — no
+# header, no empty table — so a search with no matches produced only this
+# script's own banner and exited 0, which is indistinguishable from the
+# command having failed. That is the bug class this script keeps tripping
+# over: success that looks like nothing happened.
+#
+# The result is captured rather than streamed so it can be tested for
+# emptiness. Rows still go to stdout and diagnostics to stderr, as everywhere.
+_db_report() {
+    local what="$1" sql="$2" out
+    out="$(_db_query "$sql")" || return 1
+    if [[ -z "${out//[[:space:]]/}" ]]; then
+        info "No ${what}."
+        return 0
+    fi
+    printf '%s\n' "$out"
+}
+
 # _db_query <target: local|docker|k8s> <sql> — local/docker share the same
 # local MariaDB container (_db_exec); k8s has its own separate MariaDB pod
 # in the cluster (see the architecture note on templates/k8s/mariadb.yaml),
@@ -1751,7 +1772,7 @@ _print_accounts_table() {
     # GM level lives in account_access (per-realm), not account.gmlevel,
     # which is vestigial (see create-account's notes). LEFT JOIN so an
     # account with no account_access row still shows up, as GM level 0.
-    _db_query \
+    _db_report "accounts on this realm" \
         "SELECT a.id, a.username, COALESCE(aa.gmlevel, 0) AS gmlevel, a.online, a.locked, a.last_login
          FROM realmd.account a LEFT JOIN realmd.account_access aa ON aa.id = a.id AND aa.RealmID = ${REALM_ID}
          ORDER BY a.username;"
@@ -1952,14 +1973,14 @@ cmd_search() {
             # an item that changed since; the correlated subquery picks the
             # latest row at or before the configured WOW_PATCH, matching
             # what's actually loaded on this server.
-            _db_query \
+            _db_report "items matching '${term}'" \
                 "SELECT it.entry, it.name, it.quality FROM mangos.item_template it
                  WHERE it.name LIKE '%${term_escaped}%' AND it.patch = (
                      SELECT MAX(patch) FROM mangos.item_template it2 WHERE it2.entry = it.entry AND it2.patch <= ${WOW_PATCH}
                  ) ORDER BY it.name LIMIT 50;" || return 1
             ;;
         npcs)
-            _db_query \
+            _db_report "NPCs matching '${term}'" \
                 "SELECT ct.entry, ct.name, ct.subname FROM mangos.creature_template ct
                  WHERE ct.name LIKE '%${term_escaped}%' AND ct.patch = (
                      SELECT MAX(patch) FROM mangos.creature_template ct2 WHERE ct2.entry = ct.entry AND ct2.patch <= ${WOW_PATCH}
@@ -1968,12 +1989,12 @@ cmd_search() {
         teleports)
             # game_tele — the table the '.tele <name>' GM command itself
             # searches, no patch column here.
-            _db_query \
+            _db_report "teleport locations matching '${term}'" \
                 "SELECT id, name, map, ROUND(position_x,1) AS x, ROUND(position_y,1) AS y
                  FROM mangos.game_tele WHERE name LIKE '%${term_escaped}%' ORDER BY name LIMIT 50;" || return 1
             ;;
         characters)
-            _db_query \
+            _db_report "characters matching '${term}'" \
                 "SELECT guid, name, race, class, level FROM characters.characters
                  WHERE name LIKE '%${term_escaped}%' ORDER BY name LIMIT 50;" || return 1
             ;;
