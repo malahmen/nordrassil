@@ -108,6 +108,8 @@ Config store
 Administration
   apply-sql --file PATH --db NAME [--force] [--no-record]
   restart [--graceful [SECS]] [--where ...]
+  dump --all | --db NAME [--out PATH] [--no-gzip]
+  restore --file PATH --yes [--db NAME]
 
 Profiles
   profiles                        list profiles, marking the active one
@@ -197,6 +199,39 @@ deployment where mangosd and realmd share a container, mangosd stopped on
 schedule but the container ran on until the liveness probe failed three times
 (~90s) and kubelet sent `TERM` — so `--graceful 15` took about 95s end to end.
 The default path has no such dependency.
+
+### Dump and restore
+
+`dump` writes gzipped SQL to `~/.config/nordrassil/dumps` by default. Because
+it uses `mariadb-dump --databases`, the dump carries `CREATE DATABASE`/`USE`
+and is **self-describing** — `restore` reads its targets out of the file and
+needs no `--db`.
+
+`--single-transaction` gives a consistent snapshot without locking out
+writers. `--events --routines` are included because `realmd` ships an event
+and a backup that silently drops schema objects is not a backup; restoring
+those can need elevated privileges, so restore as a user that has them
+(`root`, normally).
+
+A failed dump is written to `.partial` and renamed only on success, so there
+is never a truncated file sitting there looking like a backup.
+
+`restore` is destructive and says so: it prints the databases it will
+overwrite — read from the dump, not assumed — and **refuses without `--yes`**.
+gzip is detected by content rather than by extension, so a mislabelled file
+still works. It also checks the file looks like a SQL dump before handing it
+to a client that can write everywhere.
+
+```sh
+./nordrassil.sh dump --all                       # all four, local
+./nordrassil.sh --profile meksha dump --db mangos
+./nordrassil.sh --profile meksha restore --file dumps/default-all-....sql.gz --yes
+./nordrassil.sh --profile meksha restart         # a running server caches data
+```
+
+Because the transport comes from the profile, a dump taken from one server
+restores onto another with nothing but a different `--profile` — which is how
+you move a world between the two.
 
 ## Transports
 

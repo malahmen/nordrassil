@@ -161,6 +161,10 @@ CONFIG_FILE="${CONFIG_DIR}/nordrassil.conf"
 #
 # Selected with --profile NAME or $NORDRASSIL_PROFILE. With none active, this
 # script behaves exactly as it did before profiles existed.
+DUMP_DIR="${CONFIG_DIR}/dumps"
+# The four databases a VMaNGOS server uses. Fixed rather than configurable
+# because _db_bootstrap targets these names literally when it imports.
+NORDRASSIL_DBS=(mangos characters realmd logs)
 PROFILE_DIR="${CONFIG_DIR}/profiles"
 PROFILE="${NORDRASSIL_PROFILE:-}"
 PROFILE_FILE=""
@@ -702,7 +706,7 @@ _db_require() { _db_transport >/dev/null; }
 # so callers can pipe SQL in. The single place that knows how to reach a
 # database; every query helper above is a one-line wrapper over this.
 _db_client() {
-    _db_run "" "$@"
+    _db_run "" mariadb "$@"
 }
 
 # _db_client_stdin <mariadb args...> — as above, but forwards this shell's
@@ -715,13 +719,20 @@ _db_client() {
 # _db_is_applied/_db_mark_applied per iteration, so a stdin-forwarding
 # _db_exec eats the list. Measured, not theorised: a 5-line loop saw 1 line.
 _db_client_stdin() {
-    _db_run 1 "$@"
+    _db_run 1 mariadb "$@"
+}
+
+# _db_dump <mariadb-dump args...> — the dump client rather than the query
+# client, reached exactly the same way. stdin is not forwarded; the dump
+# comes back on stdout, which is why nothing else may be written there.
+_db_dump() {
+    _db_run "" mariadb-dump "$@"
 }
 
 # _db_run <want_stdin> <mariadb args...> — the single place that knows how to
 # reach a database. Do not call directly; use _db_client/_db_client_stdin.
 _db_run() {
-    local want_stdin="$1"; shift
+    local want_stdin="$1" client="$2"; shift 2
     # Resolved once per shell. _db_transport's 'auto' probe is cheap when it
     # succeeds, but the DB bootstrap issues dozens of statements and there is
     # no reason to re-probe for each. Callers that run this inside a $(...)
@@ -737,7 +748,7 @@ _db_run() {
             local -a cmd=( "$_DB_T" exec )
             # -i only when the caller asked for stdin: see _db_client_stdin.
             [[ -n "$want_stdin" ]] && cmd+=( -i )
-            cmd+=( -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" "$@" )
+            cmd+=( -e MYSQL_PWD "$DB_CONTAINER_NAME" "$client" -u"$DB_USER" "$@" )
             if [[ -z "$DB_SSH_HOST" ]]; then
                 # The password stays in this process's environment, never in
                 # argv — readable through /proc by this user and root, not by
@@ -752,7 +763,7 @@ _db_run() {
             fi
             ;;
         kubectl)
-            _kube_mariadb "$want_stdin" "$pw" "$@"
+            _kube_mariadb "$want_stdin" "$pw" "$client" "$@"
             ;;
         tcp)
             # --ssl-verify-server-cert=0 is explicit rather than left to the
@@ -760,7 +771,7 @@ _db_run() {
             # to stderr on every single call. Saying it here keeps the output
             # of parsed queries clean and makes the choice visible: this is a
             # LAN connection to a server with no certificate of its own.
-            local -a cmd=( mariadb -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER"
+            local -a cmd=( "$client" -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER"
                            --ssl-verify-server-cert=0 "$@" )
             if [[ -n "$want_stdin" ]]; then
                 MYSQL_PWD="$pw" "${cmd[@]}"
@@ -1501,7 +1512,7 @@ _sql_escape() { printf '%s' "$1" | sed -e "s/\\\\/\\\\\\\\/g" -e "s/'/\\\\'/g"; 
 # argument would put it right back in this host's 'ps' output (see the note
 # above _db_exec). None of the callers need stdin for anything else.
 _kube_mariadb() {
-    local want_stdin="$1" pw="$2"; shift 2
+    local want_stdin="$1" pw="$2" client="$3"; shift 3
     local pod; pod="$(_kube_pick_pod "$DB_POD_SELECTOR" "$DB_SSH_HOST")" || return 1
     # The password is the first line of stdin, consumed inside the pod by one
     # POSIX `read` — specified not to read past the newline, so anything
@@ -1510,7 +1521,7 @@ _kube_mariadb() {
     # kubectl path at all. Not in argv, which is the point.
     local inner='IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec "$@"'
     local -a cmd=( exec -i -n "$K8S_NAMESPACE" "$pod" --
-                   sh -c "$inner" _ mariadb -u"$DB_USER" "$@" )
+                   sh -c "$inner" _ "$client" -u"$DB_USER" "$@" )
     if [[ -n "$want_stdin" ]]; then
         { printf '%s\n' "$pw"; cat; } | _kube "$DB_SSH_HOST" "${cmd[@]}"
     else
@@ -2494,6 +2505,157 @@ cmd_restart() {
     esac
 }
 
+# -----------------------------------------------------------------------------
+# dump / restore — back up and put back, over whatever transport is in use.
+#
+# Both go through the same client machinery as everything else, so a dump of a
+# remote cluster's database and a dump of a local container are the same
+# command with a different profile.
+#
+# The dump carries CREATE DATABASE/USE (mariadb-dump --databases), so it is
+# self-describing and restore does not have to be told where it goes.
+# -----------------------------------------------------------------------------
+
+cmd_dump() {
+    header "nordrassil — Dump"
+    _settings
+
+    local db="" all=0 out="" gz=1
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --db)      db="$2"; shift 2 ;;
+        --all)     all=1; shift ;;
+        --out)     out="$2"; shift 2 ;;
+        --no-gzip) gz=0; shift ;;
+        *) error_exit "dump: unknown flag: $1" ;;
+    esac; done
+
+    [[ "$all" -eq 1 || -n "$db" ]] || error_exit "dump: pass --all or --db NAME (${NORDRASSIL_DBS[*]})."
+    [[ "$all" -eq 1 && -n "$db" ]] && error_exit "dump: --all and --db are mutually exclusive."
+
+    local -a dbs
+    if [[ "$all" -eq 1 ]]; then
+        dbs=( "${NORDRASSIL_DBS[@]}" )
+    else
+        [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || error_exit "dump: --db '${db}' is not a valid database name."
+        dbs=( "$db" )
+    fi
+
+    _db_require || return 1
+
+    # Each database is checked before anything is written: mariadb-dump on a
+    # missing one fails only after emitting part of its output, which would
+    # leave a file that looks like a dump and is not one.
+    local d exists
+    for d in "${dbs[@]}"; do
+        exists="$(_db_query_raw "SHOW DATABASES LIKE '$(_sql_escape "$d")';" 2>/dev/null)" || exists=""
+        [[ -n "$exists" ]] || error_exit "dump: database '${d}' does not exist on this server."
+    done
+
+    if [[ -z "$out" ]]; then
+        local what; if [[ "$all" -eq 1 ]]; then what="all"; else what="$db"; fi
+        out="${DUMP_DIR}/${PROFILE:-default}-${what}-$(date +%Y%m%d-%H%M%S).sql"
+        [[ "$gz" -eq 1 ]] && out="${out}.gz"
+    fi
+    out="${out/#\~/$HOME}"
+    mkdir -p "$(dirname "$out")"
+
+    info "databases: ${dbs[*]}"
+    info "output:    ${out}"
+
+    # --single-transaction: a consistent snapshot without locking out writers.
+    # --events --routines: realmd ships an event, and a backup that silently
+    #   drops schema objects is not a backup. Restoring them can need
+    #   elevated privileges — see restore.
+    local -a dargs=( --single-transaction --quick --events --routines --databases "${dbs[@]}" )
+
+    # Written to .partial and renamed only on success, so a dump that fails
+    # halfway is never left looking like a usable backup. pipefail (set at the
+    # top of this script) is what makes the gzip branch notice a mariadb-dump
+    # failure instead of reporting gzip's own happy exit.
+    local tmp="${out}.partial"
+    rm -f "$tmp"
+    if [[ "$gz" -eq 1 ]]; then
+        _db_dump "${dargs[@]}" | gzip -c >"$tmp" || { rm -f "$tmp"; error_exit "dump: failed — nothing written."; }
+    else
+        _db_dump "${dargs[@]}" >"$tmp" || { rm -f "$tmp"; error_exit "dump: failed — nothing written."; }
+    fi
+    [[ -s "$tmp" ]] || { rm -f "$tmp"; error_exit "dump: produced an empty file."; }
+    mv -f "$tmp" "$out"
+
+    success "Dumped ${dbs[*]} to ${out} ($(du -h "$out" | cut -f1))."
+}
+
+cmd_restore() {
+    header "nordrassil — Restore"
+    _settings
+
+    local file="" db="" yes=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --file) file="$2"; shift 2 ;;
+        --db)   db="$2"; shift 2 ;;
+        --yes)  yes=1; shift ;;
+        *) error_exit "restore: unknown flag: $1" ;;
+    esac; done
+
+    [[ -n "$file" ]] || error_exit "restore: --file is required."
+    file="${file/#\~/$HOME}"
+    [[ -f "$file" && -r "$file" ]] || error_exit "restore: cannot read ${file}."
+    [[ -s "$file" ]] || error_exit "restore: ${file} is empty."
+    [[ -z "$db" || "$db" =~ ^[A-Za-z0-9_]+$ ]] || error_exit "restore: --db '${db}' is not a valid database name."
+
+    # gzip detected by CONTENT, not by extension: a .sql that is really
+    # gzipped, or a .gz that is not, would otherwise be fed to the client as
+    # garbage and fail with a parse error halfway through.
+    local reader=cat
+    if [[ "$(head -c2 "$file" | od -An -tx1 | tr -d ' \n')" == "1f8b" ]]; then
+        command -v gzip &>/dev/null || error_exit "restore: ${file} is gzipped and gzip is not installed."
+        reader="gzip -dc"
+    fi
+
+    # Checked before handing the file to a client that can write everywhere.
+    local head_txt
+    # shellcheck disable=SC2086
+    head_txt="$($reader "$file" 2>/dev/null | head -40)" || true
+    grep -qiE 'mysql dump|mariadb dump|^CREATE |^INSERT |^USE ' <<<"$head_txt" \
+        || error_exit "restore: ${file} does not look like a SQL dump (no header, CREATE, INSERT or USE in its first 40 lines)."
+
+    # Which databases this will overwrite, read out of the dump itself rather
+    # than assumed, so the warning names what actually happens.
+    local targets=""
+    if [[ -n "$db" ]]; then
+        targets="$db (forced with --db)"
+    else
+        # shellcheck disable=SC2086
+        targets="$($reader "$file" 2>/dev/null \
+                   | grep -oiE '^(CREATE DATABASE[^`]*`|USE `)[^`]+`' \
+                   | grep -oE '`[^`]+`$' | tr -d '`' | sort -u | tr '\n' ' ')" || targets=""
+    fi
+    [[ -n "${targets// /}" ]] || error_exit "restore: the dump names no database — pass --db NAME to say where it goes."
+
+    info "file:   ${file}"
+    info "reader: ${reader}"
+    warn "OVERWRITES: ${targets}"
+
+    [[ "$yes" -eq 1 ]] || error_exit "restore: refusing without --yes. This REPLACES the data in: ${targets}"
+
+    _db_require || return 1
+
+    # A running mangosd caches world data and holds character state in
+    # memory, so after a restore it disagrees with its own database until it
+    # is restarted. Not fatal, and some restores are deliberately done live,
+    # but it is never not worth saying.
+    warn "A running server caches world and character data — run 'restart' afterwards."
+
+    # shellcheck disable=SC2086
+    if [[ -n "$db" ]]; then
+        $reader "$file" | _db_client_stdin "$db" || error_exit "restore: failed applying ${file} to ${db}."
+    else
+        $reader "$file" | _db_client_stdin || error_exit "restore: failed applying ${file}."
+    fi
+    success "Restored ${file} into ${targets}"
+    info "Now: nordrassil.sh ${PROFILE:+--profile ${PROFILE} }restart"
+}
+
 # Lists the profiles in PROFILE_DIR, marking the active one.
 cmd_profiles() {
     [[ -d "$PROFILE_DIR" ]] || { info "No profiles yet. Create one with: --profile NAME set KEY VALUE"; return; }
@@ -2574,6 +2736,14 @@ Administration:
                                   restart at the orchestrator (default), or
                                   ask mangosd to restart in SECS, warning
                                   players and saving the world first.
+  dump --all | --db NAME [--out PATH] [--no-gzip]
+                                  gzipped SQL to ~/.config/nordrassil/dumps
+                                  by default. Carries CREATE DATABASE, so a
+                                  restore needs no --db.
+  restore --file PATH --yes [--db NAME]
+                                  DESTRUCTIVE: replaces the data in whichever
+                                  databases the dump names. gzip is detected
+                                  by content. --yes is required.
 
 Search:
   search --kind items|npcs|teleports|characters --term TERM
@@ -2671,6 +2841,8 @@ main() {
         search)             cmd_search "$@" ;;
         apply-sql)          cmd_apply_sql "$@" ;;
         restart)            cmd_restart "$@" ;;
+        dump)               cmd_dump "$@" ;;
+        restore)            cmd_restore "$@" ;;
         build-image)        cmd_build_image "$@" ;;
         run-docker)         cmd_run_docker "$@" ;;
         stop-docker)        cmd_stop_docker "$@" ;;
