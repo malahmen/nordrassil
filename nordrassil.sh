@@ -242,6 +242,7 @@ SETTING_KEYS=(
     REQ_EMAIL_VERIFICATION STRICT_VERSION_CHECK WARDEN_ENABLED STRICT_PLAYER_NAMES
     IMAGE_TAG SERVER_CONTAINER_NAME K8S_NAMESPACE CUSTOM_SQL
     K8S_STORAGE_TYPE K8S_DATA_HOSTPATH K8S_DB_HOSTPATH K8S_STORAGECLASS
+    DB_TRANSPORT SERVER_TRANSPORT DB_POD_SELECTOR SERVER_POD_SELECTOR SERVER_FIFO
 )
 
 _settings() {
@@ -264,6 +265,33 @@ _settings() {
     # here just needs to keep matching reality, not the project's new name.
     DB_CONTAINER_NAME="$(cfg_default DB_CONTAINER_NAME nordrassil-mariadb)"
     DB_VOLUME="$(cfg_default DB_VOLUME vanilla-wow-mariadb-data)"
+
+    # TRANSPORTS. How to reach the database and how to reach mangosd are two
+    # independent questions, and conflating them is what made this script
+    # unable to describe a real deployment: the kuat homelab runs the server
+    # as a k8s Deployment while its MariaDB is a podman quadlet on the host,
+    # so no single local/docker/k8s answer is correct for it.
+    #
+    #   DB_TRANSPORT      auto | docker | kubectl | tcp
+    #   SERVER_TRANSPORT  auto | local  | docker  | kubectl
+    #
+    # 'auto' keeps the pre-split behaviour: probe for a running local
+    # container first, then the cluster, then a TCP endpoint. Set either
+    # explicitly to point this script at a deployment it cannot guess.
+    #
+    # 'tcp' uses DB_HOST/DB_PORT, which until now were only ever written into
+    # the rendered conf files — the server's own connection string — and never
+    # used for this script's queries. It needs a mariadb client on this host.
+    DB_TRANSPORT="$(cfg_default DB_TRANSPORT auto)"
+    SERVER_TRANSPORT="$(cfg_default SERVER_TRANSPORT auto)"
+    # Label selectors and the console FIFO path are settings rather than
+    # constants for the same reason: they were hardcoded to this project's own
+    # k8s templates, so any other deployment's pods were simply invisible.
+    DB_POD_SELECTOR="$(cfg_default DB_POD_SELECTOR app=vanilla-wow-mariadb)"
+    SERVER_POD_SELECTOR="$(cfg_default SERVER_POD_SELECTOR app=vanilla-wow-server)"
+    # Where mangosd's console FIFO lives INSIDE the container. This repo's
+    # image puts it at /app; kuat's azeroth image uses /opt/azeroth.
+    SERVER_FIFO="$(cfg_default SERVER_FIFO /app/mangosd.stdin)"
     REALM_ID="$(cfg_default REALM_ID 1)"
     REALM_PORT="$(cfg_default REALM_PORT 3724)"
     WORLD_PORT="$(cfg_default WORLD_PORT 8085)"
@@ -444,16 +472,149 @@ cmd_install_deps() {
 # root — not by everyone, and not by a casual 'ps'. Removing that too would
 # mean not handing the password to a client process at all.
 
+# -----------------------------------------------------------------------------
+# Transports
+#
+# Two independent axes. See the DB_TRANSPORT note in _settings for why: a
+# deployment can perfectly well run its server in k8s and its database
+# somewhere else entirely, and the single local/docker/k8s answer this script
+# used to insist on could not express that.
+# -----------------------------------------------------------------------------
+
+# _kube_pick_pod <label selector> — one Running, non-terminating pod name.
+#
+# Deliberately NOT `jsonpath={.items[0].metadata.name}`, which is what the
+# rest of this script used to do: .items[0] is simply the first pod the API
+# returns, which during a rollout is as likely to be a Terminating one as the
+# live one — and exec'ing into a pod that is going away fails in a way that
+# reads like a connection problem. A terminating pod still reports phase
+# Running, so the phase alone is not enough; a deletionTimestamp is the thing
+# that distinguishes it, hence the two-field line and `NF==1`.
+_kube_pick_pod() {
+    local selector="$1" ctx_flags pod
+    command -v kubectl &>/dev/null || { warn "kubectl not found, needed for the kubectl transport."; return 1; }
+    ctx_flags="$(kubectl_context_flag)"
+    # shellcheck disable=SC2086
+    pod="$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l "$selector" \
+             --field-selector=status.phase=Running \
+             -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null \
+           | awk 'NF==1{print $1; exit}')" || pod=""
+    [[ -n "$pod" ]] || {
+        warn "No Running pod matching '${selector}' in namespace ${K8S_NAMESPACE}."
+        return 1
+    }
+    printf '%s' "$pod"
+}
+
+# _db_transport — echoes the resolved DB transport, autodetecting when 'auto'.
+_db_transport() {
+    case "$DB_TRANSPORT" in
+        docker|kubectl|tcp) printf '%s' "$DB_TRANSPORT"; return 0 ;;
+        auto) ;;
+        *) error_exit "DB_TRANSPORT must be auto|docker|kubectl|tcp (got '${DB_TRANSPORT}')." ;;
+    esac
+
+    # Probe order preserves the behaviour from before the split: the local
+    # container was the only thing the DB helpers ever looked at, so it stays
+    # first and an existing setup keeps working untouched.
+    if [[ "$(docker inspect --type container "$DB_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]]; then
+        printf 'docker'; return 0
+    fi
+    if command -v kubectl &>/dev/null; then
+        local ctx_flags; ctx_flags="$(kubectl_context_flag)"
+        # shellcheck disable=SC2086
+        if kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l "$DB_POD_SELECTOR" --no-headers 2>/dev/null | grep -q Running; then
+            printf 'kubectl'; return 0
+        fi
+    fi
+    if command -v mariadb &>/dev/null \
+       && timeout 3 bash -c "echo >/dev/tcp/${DB_HOST}/${DB_PORT}" 2>/dev/null; then
+        printf 'tcp'; return 0
+    fi
+
+    warn "No reachable database found."
+    warn "  checked: container '${DB_CONTAINER_NAME}', pods '${DB_POD_SELECTOR}' in ${K8S_NAMESPACE}, tcp ${DB_HOST}:${DB_PORT}"
+    warn "  set DB_TRANSPORT (docker|kubectl|tcp) and DB_HOST/DB_PORT to point at it explicitly."
+    return 1
+}
+
+# _db_require — resolve the transport for its side effects only, so a command
+# fails with a useful message before it starts prompting for arguments.
+_db_require() { _db_transport >/dev/null; }
+
+# _db_client <mariadb args...> — runs the mariadb client against the
+# configured database, whatever it takes to reach it. stdin is passed through,
+# so callers can pipe SQL in. The single place that knows how to reach a
+# database; every query helper above is a one-line wrapper over this.
+_db_client() {
+    _db_run "" "$@"
+}
+
+# _db_client_stdin <mariadb args...> — as above, but forwards this shell's
+# stdin to the client, for piping a .sql file in.
+#
+# The two are separate because forwarding stdin when the caller did not ask
+# for it is actively destructive: `docker exec -i` (and the `cat` in the
+# kubectl path) will drain whatever stdin happens to be connected. The
+# migration loop in _db_bootstrap reads its file list on stdin and calls
+# _db_is_applied/_db_mark_applied per iteration, so a stdin-forwarding
+# _db_exec eats the list. Measured, not theorised: a 5-line loop saw 1 line.
+_db_client_stdin() {
+    _db_run 1 "$@"
+}
+
+# _db_run <want_stdin> <mariadb args...> — the single place that knows how to
+# reach a database. Do not call directly; use _db_client/_db_client_stdin.
+_db_run() {
+    local want_stdin="$1"; shift
+    # Resolved once per shell. _db_transport's 'auto' probe is cheap when it
+    # succeeds, but the DB bootstrap issues dozens of statements and there is
+    # no reason to re-probe for each. Callers that run this inside a $(...)
+    # substitution get their own subshell and so resolve once more —
+    # harmless, and not worth contorting the call sites to avoid.
+    if [[ -z "${_DB_T:-}" ]]; then
+        _DB_T="$(_db_transport)" || return 1
+    fi
+    case "$_DB_T" in
+        docker)
+            if [[ -n "$want_stdin" ]]; then
+                MYSQL_PWD="$DB_PASS" docker exec -i -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" "$@"
+            else
+                MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" "$@" </dev/null
+            fi
+            ;;
+        kubectl)
+            _kube_mariadb "$want_stdin" -u"$DB_USER" "$@"
+            ;;
+        tcp)
+            # --ssl-verify-server-cert=0 is explicit rather than left to the
+            # client, which otherwise disables it anyway and prints a warning
+            # to stderr on every single call. Saying it here keeps the output
+            # of parsed queries clean and makes the choice visible: this is a
+            # LAN connection to a server with no certificate of its own.
+            if [[ -n "$want_stdin" ]]; then
+                MYSQL_PWD="$DB_PASS" mariadb \
+                    -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER" \
+                    --ssl-verify-server-cert=0 "$@"
+            else
+                MYSQL_PWD="$DB_PASS" mariadb \
+                    -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER" \
+                    --ssl-verify-server-cert=0 "$@" </dev/null
+            fi
+            ;;
+    esac
+}
+
 _db_exec() {
     # _db_exec <sql>
-    MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -e "$1"
+    _db_client -e "$1"
 }
 
 _db_import() {
     # _db_import <database> <file>
     local db="$1" file="$2"
     [[ -f "$file" ]] || { warn "Missing SQL file, skipping: ${file}"; return 0; }
-    MYSQL_PWD="$DB_PASS" docker exec -i -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" "$db" < "$file"
+    _db_client_stdin "$db" < "$file"
 }
 
 _ensure_local_mariadb() {
@@ -506,14 +667,14 @@ _ensure_local_mariadb() {
 # _db_table_exists <database> <table>
 _db_table_exists() {
     local out
-    out="$(_db_query_raw docker "SHOW TABLES FROM ${1} LIKE '$(_sql_escape "$2")';" 2>/dev/null)" || out=""
+    out="$(_db_query_raw "SHOW TABLES FROM ${1} LIKE '$(_sql_escape "$2")';" 2>/dev/null)" || out=""
     [[ -n "$out" ]]
 }
 
 # _db_is_applied <name>
 _db_is_applied() {
     local out
-    out="$(_db_query_raw docker "SELECT 1 FROM realmd.nordrassil_applied WHERE name='$(_sql_escape "$1")' LIMIT 1;" 2>/dev/null)" || out=""
+    out="$(_db_query_raw "SELECT 1 FROM realmd.nordrassil_applied WHERE name='$(_sql_escape "$1")' LIMIT 1;" 2>/dev/null)" || out=""
     [[ -n "$out" ]]
 }
 
@@ -1097,87 +1258,66 @@ cmd_status() {
 # than guessing).
 # -----------------------------------------------------------------------------
 
-# _detect_running_target — echoes "local"/"docker"/"k8s" on stdout for
-# whichever deployment mangosd is actually running in right now, prompting
-# if more than one qualifies. warn+return 1 if none does. Shared by every
-# command below that needs to reach a live mangosd console.
-_detect_running_target() {
+# _server_transport — echoes "local"/"docker"/"kubectl" on stdout for the
+# deployment whose mangosd console this script should talk to: the
+# SERVER_TRANSPORT setting if it names one, otherwise whichever is actually
+# running, prompting (via --where) if more than one qualifies. warn+return 1
+# if none does. Shared by every command that needs a live mangosd console.
+#
+# This is the SERVER half of the transport split — reaching the database is
+# _db_transport's problem and resolves separately, because the two need not
+# live in the same place.
+_server_transport() {
+    # An explicit setting wins outright. Probing can only see what this host
+    # happens to reach, and "where is mangosd running" is not the same
+    # question as "which deployment am I administering".
+    case "$SERVER_TRANSPORT" in
+        local|docker|kubectl) printf '%s' "$SERVER_TRANSPORT"; return 0 ;;
+        auto) ;;
+        *) error_exit "SERVER_TRANSPORT must be auto|local|docker|kubectl (got '${SERVER_TRANSPORT}')." ;;
+    esac
+
     local -a targets=()
     pf_is_running "${PF_DIR}/mangosd.pid" && targets+=("local")
     [[ "$(docker inspect --type container "$SERVER_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]] \
         && targets+=("docker")
-    # Same --context/--kind target as the exec path below — otherwise the
-    # detection looks at the ambient kube context while the console command
-    # goes to the requested one.
-    local ctx_flags; ctx_flags="$(kubectl_context_flag)"
     if command -v kubectl &>/dev/null; then
+        # Same --context/--kind target as the exec path, otherwise detection
+        # looks at the ambient context while the command goes to another.
+        local ctx_flags; ctx_flags="$(kubectl_context_flag)"
         # shellcheck disable=SC2086
-        kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server --no-headers 2>/dev/null | grep -q Running \
-            && targets+=("k8s")
+        kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l "$SERVER_POD_SELECTOR" --no-headers 2>/dev/null | grep -q Running \
+            && targets+=("kubectl")
     fi
 
     if [[ ${#targets[@]} -eq 0 ]]; then
-        warn "mangosd doesn't appear to be running anywhere (checked local, docker, k8s). Start it first."
+        warn "mangosd doesn't appear to be running anywhere."
+        warn "  checked: local pidfile, container '${SERVER_CONTAINER_NAME}', pods '${SERVER_POD_SELECTOR}' in ${K8S_NAMESPACE}"
+        warn "  set SERVER_TRANSPORT (local|docker|kubectl) to name it explicitly."
         return 1
     fi
 
-    # WHERE (from --where local|docker|k8s) disambiguates when mangosd is running
-    # in more than one place; with a single target it's optional. The front-end
-    # asks the operator only when needed and passes --where.
     local chosen="${targets[0]}"
     if [[ ${#targets[@]} -gt 1 ]]; then
         if [[ -n "${WHERE:-}" ]]; then
-            printf '%s\n' "${targets[@]}" | grep -qx "$WHERE" \
+            # 'k8s' is still accepted: --where predates the transport split
+            # and the gum front-end still offers that spelling.
+            local w="$WHERE"; [[ "$w" == "k8s" ]] && w="kubectl"
+            printf '%s\n' "${targets[@]}" | grep -qx "$w" \
                 || { warn "--where '${WHERE}' isn't among the running targets: ${targets[*]}"; return 1; }
-            chosen="$WHERE"
+            chosen="$w"
         else
             warn "mangosd is running in more than one place (${targets[*]}). Pass --where <${targets[0]}|...> to choose."
             return 1
         fi
     fi
 
-    # k8s only: make sure a pod is actually addressable. Callers run this
-    # function in a $(...) subshell, so nothing assigned here survives —
-    # _send_console_cmd/_db_query resolve the context flags and pod name
-    # themselves for the k8s case.
-    if [[ "$chosen" == "k8s" ]]; then
-        local pod
-        # '|| pod=""': a failing kubectl must fall through to the warn below,
-        # not kill the script silently under set -e (stderr is muted).
-        # shellcheck disable=SC2086
-        pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || pod=""
-        if [[ -z "$pod" ]]; then
-            warn "No running vanilla-wow-server pod found in namespace ${K8S_NAMESPACE}."
-            return 1
-        fi
+    # Confirm a pod is addressable before the caller commits to it.
+    if [[ "$chosen" == "kubectl" ]]; then
+        _kube_pick_pod "$SERVER_POD_SELECTOR" >/dev/null || return 1
     fi
 
-    echo "$chosen"
-}
-
-# _detect_db_target — like _detect_running_target, but for queries that only
-# need the database, not mangosd itself (e.g. search, which reads static
-# reference tables that don't require the server to be up at all). Local
-# native and Docker share the exact same local MariaDB container, so unlike
-# _detect_running_target there's nothing to disambiguate between them —
-# echoes "docker" for that shared container, "k8s" for the cluster's own
-# separate MariaDB pod.
-_detect_db_target() {
-    if [[ "$(docker inspect --type container "$DB_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]]; then
-        echo "docker"
-        return 0
-    fi
-    if command -v kubectl &>/dev/null; then
-        # Same --context/--kind target _db_query uses for the k8s case.
-        local ctx_flags; ctx_flags="$(kubectl_context_flag)"
-        # shellcheck disable=SC2086
-        if kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb --no-headers 2>/dev/null | grep -q Running; then
-            echo "k8s"
-            return 0
-        fi
-    fi
-    warn "No reachable database found (checked the local MariaDB container and K8s). Run 'configure' or 'run-k8s' first."
-    return 1
+    printf '%s' "$chosen"
 }
 
 # Escapes a value for embedding inside a single-quoted SQL string literal
@@ -1190,21 +1330,31 @@ _sql_escape() { printf '%s' "$1" | sed -e "s/\\\\/\\\\\\\\/g" -e "s/'/\\\\'/g"; 
 # argument would put it right back in this host's 'ps' output (see the note
 # above _db_exec). None of the callers need stdin for anything else.
 _kube_mariadb() {
+    local want_stdin="$1"; shift
     local ctx_flags pod
     ctx_flags="$(kubectl_context_flag)"
-    # '|| pod=""': a failing kubectl must reach the warn below instead of
-    # ending the script silently under set -e (stderr is muted).
-    # shellcheck disable=SC2086
-    pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-mariadb -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || pod=""
-    if [[ -z "$pod" ]]; then
-        warn "No running vanilla-wow-mariadb pod found in namespace ${K8S_NAMESPACE}."
-        return 1
+    pod="$(_kube_pick_pod "$DB_POD_SELECTOR")" || return 1
+    # The password arrives as the FIRST LINE of stdin and is consumed by a
+    # single POSIX `read`, which is specified not to consume past the newline
+    # — so whatever follows is still intact for the client on stdin. That
+    # matters: the previous version piped the password as the WHOLE of stdin,
+    # which silently made it impossible to feed SQL in this way, so
+    # _db_import had no kubectl path at all.
+    #
+    # Still not in argv, which is the point (see the note above _db_exec).
+    #
+    # `cat` only when the caller asked for stdin: otherwise it would drain
+    # whatever stdin is connected, which is the same hazard that makes
+    # `docker exec -i` unsafe here (see _db_client_stdin).
+    if [[ -n "$want_stdin" ]]; then
+        # shellcheck disable=SC2086
+        { printf '%s\n' "$DB_PASS"; cat; } | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- \
+            sh -c 'IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec "$@"' _ mariadb "$@"
+    else
+        # shellcheck disable=SC2086
+        printf '%s\n' "$DB_PASS" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- \
+            sh -c 'IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec "$@"' _ mariadb "$@"
     fi
-    # sh -c '<script>' _ mariadb <args>: '_' becomes $0, so "$@" inside the
-    # script is exactly the command to run.
-    # shellcheck disable=SC2086
-    printf '%s' "$DB_PASS" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- \
-        sh -c 'MYSQL_PWD="$(cat)"; export MYSQL_PWD; exec "$@"' _ mariadb "$@"
 }
 
 # _db_query <target: local|docker|k8s> <sql> — local/docker share the same
@@ -1212,36 +1362,17 @@ _kube_mariadb() {
 # in the cluster (see the architecture note on templates/k8s/mariadb.yaml),
 # so that one needs its own kubectl exec instead of _db_exec's docker exec.
 _db_query() {
-    local tgt="$1" sql="$2"
-    case "$tgt" in
-        local|docker)
-            # -t (table format), not _db_exec's plain tab-separated output —
-            # every _db_query caller is a human-facing read, not the DB
-            # bootstrap machinery _db_exec also serves.
-            MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -t -e "$sql"
-            ;;
-        k8s)
-            _kube_mariadb -u"$DB_USER" -t -e "$sql"
-            ;;
-    esac
+    _db_client -t -e "$1"
 }
 
 # _db_query_raw <target> <sql> — like _db_query, but -N -B (no column
 # headers, tab-separated, no ASCII table borders) for callers that need to
 # actually parse a single value out of the result, not display it.
 _db_query_raw() {
-    local tgt="$1" sql="$2"
-    case "$tgt" in
-        local|docker)
-            MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" -N -B -e "$sql"
-            ;;
-        k8s)
-            _kube_mariadb -u"$DB_USER" -N -B -e "$sql"
-            ;;
-    esac
+    _db_client -N -B -e "$1"
 }
 
-# _send_console_cmd <local|docker|k8s> <single console command line>
+# _send_console_cmd <local|docker|kubectl> <single console command line>
 _send_console_cmd() {
     local tgt="$1" line="$2"
     case "$tgt" in
@@ -1254,22 +1385,16 @@ _send_console_cmd() {
             printf '%s\n' "$line" > "$fifo"
             ;;
         docker)
-            printf '%s\n' "$line" | docker exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > /app/mangosd.stdin" \
-                || { warn "Failed to reach the container's console FIFO."; return 1; }
+            printf '%s\n' "$line" | docker exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > ${SERVER_FIFO}" \
+                || { warn "Failed to reach the container's console FIFO (${SERVER_FIFO})."; return 1; }
             ;;
-        k8s)
-            # Same --context/--kind resolution as _db_query's k8s case.
+        kubectl)
             local ctx_flags pod
             ctx_flags="$(kubectl_context_flag)"
+            pod="$(_kube_pick_pod "$SERVER_POD_SELECTOR")" || return 1
             # shellcheck disable=SC2086
-            pod=$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l app=vanilla-wow-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-            if [[ -z "$pod" ]]; then
-                warn "No running vanilla-wow-server pod found in namespace ${K8S_NAMESPACE}."
-                return 1
-            fi
-            # shellcheck disable=SC2086
-            printf '%s\n' "$line" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- sh -c "cat > /app/mangosd.stdin" \
-                || { warn "Failed to reach the pod's console FIFO."; return 1; }
+            printf '%s\n' "$line" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- sh -c "cat > ${SERVER_FIFO}" \
+                || { warn "Failed to reach the pod's console FIFO (${SERVER_FIFO})."; return 1; }
             ;;
     esac
 }
@@ -1305,7 +1430,7 @@ cmd_create_account() {
     [[ "$gm_num" =~ ^[0-6]$ ]] || error_exit "create-account: --level must be 0-6 (see the GM-level scale)."
 
     local target
-    target=$(_detect_running_target) || return 1
+    target=$(_server_transport) || return 1
 
     # 'account create' and 'account set gmlevel' can't be sent as one burst:
     # live-tested, sending both in a single write reliably fails the gmlevel
@@ -1323,7 +1448,7 @@ cmd_create_account() {
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
+        kubectl) info "Check: kubectl -n ${K8S_NAMESPACE} logs -l ${SERVER_POD_SELECTOR}" ;;
     esac
 
     success "Account '${user_input}' created (GM level: ${gm_num})."
@@ -1331,14 +1456,13 @@ cmd_create_account() {
 
 # _print_accounts_table <target> — shared by list-accounts and
 # delete-account (as a courtesy display before prompting for a username),
-# so delete-account doesn't need to run _detect_running_target a second time
+# so delete-account doesn't need to run _server_transport a second time
 # (and risk a second "which target?" prompt) just to show the same list.
 _print_accounts_table() {
-    local target="$1"
     # GM level lives in account_access (per-realm), not account.gmlevel,
     # which is vestigial (see create-account's notes). LEFT JOIN so an
     # account with no account_access row still shows up, as GM level 0.
-    _db_query "$target" \
+    _db_query \
         "SELECT a.id, a.username, COALESCE(aa.gmlevel, 0) AS gmlevel, a.online, a.locked, a.last_login
          FROM realmd.account a LEFT JOIN realmd.account_access aa ON aa.id = a.id AND aa.RealmID = ${REALM_ID}
          ORDER BY a.username;"
@@ -1353,9 +1477,9 @@ cmd_list_accounts() {
     esac; done
 
     local target
-    target=$(_detect_running_target) || return 1
+    target=$(_server_transport) || return 1
 
-    _print_accounts_table "$target" || return 1
+    _print_accounts_table || return 1
 }
 
 cmd_delete_account() {
@@ -1374,7 +1498,7 @@ cmd_delete_account() {
     # Destructive (also removes the account's characters). The front-end confirms
     # before calling; the engine executes the named deletion directly.
     local target
-    target=$(_detect_running_target) || return 1
+    target=$(_server_transport) || return 1
 
     # Needed for the account_access cleanup below: that row can only be
     # looked up by account id, and 'account delete' removes the account row
@@ -1383,7 +1507,7 @@ cmd_delete_account() {
     # a failed query must be reported here — under set -e a bare failing
     # assignment would otherwise end the script with no message at all.
     local acc_id user_sql; user_sql="$(_sql_escape "${user_input^^}")"
-    acc_id=$(_db_query_raw "$target" "SELECT id FROM realmd.account WHERE username='${user_sql}';" 2>/dev/null) \
+    acc_id=$(_db_query_raw "SELECT id FROM realmd.account WHERE username='${user_sql}';" 2>/dev/null) \
         || { warn "Account id lookup failed (is MariaDB reachable with DB_USER/DB_PASS?) — the account_access cleanup below will be skipped."; acc_id=""; }
 
     _send_console_cmd "$target" "account delete ${user_input}" || return 1
@@ -1395,13 +1519,13 @@ cmd_delete_account() {
     # here so repeated create/delete cycles don't quietly accumulate junk.
     if [[ "$acc_id" =~ ^[0-9]+$ ]]; then
         sleep 2
-        _db_query "$target" "DELETE FROM realmd.account_access WHERE id=${acc_id};" &>/dev/null || true
+        _db_query "DELETE FROM realmd.account_access WHERE id=${acc_id};" &>/dev/null || true
     fi
 
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
+        kubectl) info "Check: kubectl -n ${K8S_NAMESPACE} logs -l ${SERVER_POD_SELECTOR}" ;;
     esac
 
     success "Delete command sent for '${user_input}'."
@@ -1423,14 +1547,14 @@ cmd_set_account_level() {
     [[ "$gm_num" =~ ^[0-6]$ ]] || error_exit "set-account-level: --level must be 0-6."
 
     local target
-    target=$(_detect_running_target) || return 1
+    target=$(_server_transport) || return 1
 
     _send_console_cmd "$target" "account set gmlevel ${user_input} ${gm_num}" || return 1
 
     case "$target" in
         local)  info "Check ${INSTALL_DIR}/logs/mangosd.out to confirm." ;;
         docker) info "Check: docker logs ${SERVER_CONTAINER_NAME}" ;;
-        k8s)    info "Check: kubectl -n ${K8S_NAMESPACE} logs deployment/vanilla-wow-server" ;;
+        kubectl) info "Check: kubectl -n ${K8S_NAMESPACE} logs -l ${SERVER_POD_SELECTOR}" ;;
     esac
 
     success "GM level command sent for '${user_input}' (level: ${gm_num})."
@@ -1444,7 +1568,7 @@ cmd_set_account_level() {
 # sidestep for a specific character on a case-by-case basis, without
 # touching those rules for everyone else. This is a pure database
 # operation, not a console command, so it works even if mangosd isn't
-# running at all (_detect_db_target, not _detect_running_target) — but the
+# running at all (_db_require, not _server_transport) — but the
 # character must be offline: mangosd only reads a character's row from the
 # database at login, an online character's data lives in memory and a
 # logout would overwrite this change with whatever's already loaded there.
@@ -1462,13 +1586,13 @@ cmd_rename_character() {
     [[ -n "$new_name" ]] || error_exit "rename-character: --to is required (the new name)."
 
     local target
-    target=$(_detect_db_target) || return 1
+    _db_require || return 1
 
     local old_name_escaped; old_name_escaped="$(_sql_escape "$old_name")"
     local row guid online
     # See delete-account: stderr is muted, so a failed query is reported here
     # rather than silently ending the script under set -e.
-    row=$(_db_query_raw "$target" "SELECT guid, online FROM characters.characters WHERE name='${old_name_escaped}';" 2>/dev/null) \
+    row=$(_db_query_raw "SELECT guid, online FROM characters.characters WHERE name='${old_name_escaped}';" 2>/dev/null) \
         || { warn "Character lookup failed (is MariaDB reachable with DB_USER/DB_PASS?)."; return 1; }
     if [[ -z "$row" ]]; then
         warn "No character named '${old_name}' found."
@@ -1489,7 +1613,7 @@ cmd_rename_character() {
 
     local new_name_escaped; new_name_escaped="$(_sql_escape "$new_name")"
     local existing
-    existing=$(_db_query_raw "$target" "SELECT guid FROM characters.characters WHERE name='${new_name_escaped}';" 2>/dev/null) \
+    existing=$(_db_query_raw "SELECT guid FROM characters.characters WHERE name='${new_name_escaped}';" 2>/dev/null) \
         || { warn "Name availability check failed (is MariaDB reachable with DB_USER/DB_PASS?)."; return 1; }
     if [[ -n "$existing" && "$existing" != "$guid" ]]; then
         warn "'${new_name}' is already taken by another character."
@@ -1502,7 +1626,7 @@ cmd_rename_character() {
     # was already set (from an earlier attempt, or any other GM action)
     # and this UPDATE only ever touched the name column, never the flag
     # that actually drives the client's rename prompt.
-    _db_query "$target" "UPDATE characters.characters SET name='${new_name_escaped}', character_flags = character_flags & ~0x4000 WHERE guid=${guid};" &>/dev/null || return 1
+    _db_query "UPDATE characters.characters SET name='${new_name_escaped}', character_flags = character_flags & ~0x4000 WHERE guid=${guid};" &>/dev/null || return 1
     success "'${old_name}' renamed to '${new_name}'."
 }
 
@@ -1511,8 +1635,7 @@ cmd_rename_character() {
 # characters. All four are plain reference-data reads (no SRP6/console
 # involved, unlike the account commands), so this goes straight to the
 # database via _db_query, and works even if mangosd itself isn't running —
-# only the database needs to be up (_detect_db_target, not
-# _detect_running_target).
+# only the database needs to be up (_db_require, not _server_transport).
 # -----------------------------------------------------------------------------
 
 cmd_search() {
@@ -1529,7 +1652,7 @@ cmd_search() {
     [[ -n "$term" ]] || error_exit "search: --term is required."
 
     local target
-    target=$(_detect_db_target) || return 1
+    _db_require || return 1
     local term_escaped; term_escaped="$(_sql_escape "$term")"
 
     case "$kind" in
@@ -1540,14 +1663,14 @@ cmd_search() {
             # an item that changed since; the correlated subquery picks the
             # latest row at or before the configured WOW_PATCH, matching
             # what's actually loaded on this server.
-            _db_query "$target" \
+            _db_query \
                 "SELECT it.entry, it.name, it.quality FROM mangos.item_template it
                  WHERE it.name LIKE '%${term_escaped}%' AND it.patch = (
                      SELECT MAX(patch) FROM mangos.item_template it2 WHERE it2.entry = it.entry AND it2.patch <= ${WOW_PATCH}
                  ) ORDER BY it.name LIMIT 50;" || return 1
             ;;
         npcs)
-            _db_query "$target" \
+            _db_query \
                 "SELECT ct.entry, ct.name, ct.subname FROM mangos.creature_template ct
                  WHERE ct.name LIKE '%${term_escaped}%' AND ct.patch = (
                      SELECT MAX(patch) FROM mangos.creature_template ct2 WHERE ct2.entry = ct.entry AND ct2.patch <= ${WOW_PATCH}
@@ -1556,12 +1679,12 @@ cmd_search() {
         teleports)
             # game_tele — the table the '.tele <name>' GM command itself
             # searches, no patch column here.
-            _db_query "$target" \
+            _db_query \
                 "SELECT id, name, map, ROUND(position_x,1) AS x, ROUND(position_y,1) AS y
                  FROM mangos.game_tele WHERE name LIKE '%${term_escaped}%' ORDER BY name LIMIT 50;" || return 1
             ;;
         characters)
-            _db_query "$target" \
+            _db_query \
                 "SELECT guid, name, race, class, level FROM characters.characters
                  WHERE name LIKE '%${term_escaped}%' ORDER BY name LIMIT 50;" || return 1
             ;;
@@ -2067,6 +2190,25 @@ Search:
 
 Config store (used by the scomp-link front-end):
   set KEY VALUE | get KEY | config | list-custom
+
+Transports (where this script looks for the server and the database):
+  Two independent settings, because they need not be in the same place — a
+  server can run in k8s while its database runs under podman on the host.
+
+  set DB_TRANSPORT      auto | docker | kubectl | tcp
+  set SERVER_TRANSPORT  auto | local  | docker  | kubectl
+
+  'auto' probes the local container, then the cluster, then TCP. Supporting
+  settings, each of which used to be hardcoded:
+
+  set DB_HOST / DB_PORT        the tcp transport's endpoint
+  set DB_POD_SELECTOR          default app=vanilla-wow-mariadb
+  set SERVER_POD_SELECTOR      default app=vanilla-wow-server
+  set SERVER_FIFO              mangosd's console FIFO inside the container
+                               (default /app/mangosd.stdin)
+
+  The kubectl transports need kubectl on THIS host; tcp needs a mariadb
+  client. --where still selects between several running servers.
 
   help | -h | --help
 EOF
