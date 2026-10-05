@@ -70,6 +70,7 @@ of Dockerfile / entrypoint / k8s manifests / source patches). No `gum`, no
 | --- | --- |
 | `--context CTX` | use kube-context `CTX` |
 | `--kind CLUSTER` | use kind cluster `CLUSTER` (context `kind-CLUSTER`; side-loads the image) |
+| `--profile NAME` | use the profile `NAME` (see [Profiles](#profiles)); also `$NORDRASSIL_PROFILE` |
 
 Neither given ⇒ the current kube context.
 
@@ -103,6 +104,10 @@ Search
 
 Config store
   set KEY VALUE | get KEY | config | list-custom
+
+Profiles
+  profiles                        list profiles, marking the active one
+  forget [--all]                  drop the cached database password
 
 help | -h | --help
 ```
@@ -149,11 +154,68 @@ Things worth knowing:
 ./nordrassil.sh rename-character --from Leeroy --to Jenkins
 ```
 
+## Transports
+
+Reaching the **database** and reaching **mangosd** are separate questions, and
+a deployment need not answer them the same way — a server can run as a k8s
+Deployment while its MariaDB runs in podman on the host beside it. Two
+independent settings, so no single value has to describe the whole stack:
+
+| | Values |
+| --- | --- |
+| `DB_TRANSPORT` | `auto` \| `docker` \| `podman` \| `kubectl` \| `tcp` |
+| `SERVER_TRANSPORT` | `auto` \| `local` \| `docker` \| `podman` \| `kubectl` |
+
+`auto` probes the local container, then the cluster, then a TCP endpoint, which
+is what this script did before the two were separable.
+
+**SSH is a third, orthogonal axis.** `DB_SSH_HOST` / `SERVER_SSH_HOST` say
+*where the orchestrator runs*, not which one — so administering a remote
+cluster needs no `kubectl` on the machine you are sitting at, and a remote
+podman container needs no published port. Remoteness multiplies nothing:
+nothing about reaching a container engine changes because it is on another
+host. With an ssh host set the transport must be explicit; `auto` will not
+probe across a network. Every ssh call is `BatchMode`, so key-based auth only.
+
+## Profiles
+
+A profile is one server. `~/.config/nordrassil/profiles/NAME.conf`, layered
+**over** `nordrassil.conf`: a key present in the profile wins, anything absent
+falls through to the base file. Shared settings stay in one place and a profile
+carries only what actually differs. `set` writes to the active profile, or to
+the base file when none is active.
+
+`DB_PASS=ask` prompts **once per session, per profile**. The answer is cached
+in `$XDG_RUNTIME_DIR` — tmpfs, mode `0600`, gone on logout — so it is never
+written to a persistent file; with no `$XDG_RUNTIME_DIR` it simply prompts
+every time. `forget` clears it.
+
+A worked example: a k8s server on another host, its MariaDB in podman beside
+it, driven from a machine with neither `kubectl` nor the password on it.
+
+```sh
+./nordrassil.sh --profile meksha set DB_TRANSPORT podman
+./nordrassil.sh --profile meksha set DB_SSH_HOST meksha
+./nordrassil.sh --profile meksha set DB_CONTAINER_NAME mariadb
+./nordrassil.sh --profile meksha set DB_PASS ask
+./nordrassil.sh --profile meksha set SERVER_TRANSPORT kubectl
+./nordrassil.sh --profile meksha set SERVER_SSH_HOST meksha
+./nordrassil.sh --profile meksha set K8S_NAMESPACE azeroth
+./nordrassil.sh --profile meksha set SERVER_POD_SELECTOR app=azeroth
+./nordrassil.sh --profile meksha set SERVER_K8S_CONTAINER azeroth
+./nordrassil.sh --profile meksha set SERVER_FIFO /opt/azeroth/mangosd.stdin
+
+./nordrassil.sh --profile meksha search --kind npcs --term Hogger
+./nordrassil.sh --profile meksha create-account --name bob --pass hunter2
+```
+
 ## Configuration
 
 State lives in `~/.config/nordrassil/nordrassil.conf` (XDG-style, `key=value`,
-one setting per line). Read/write it with `get`/`set`/`config`; commands read it
-back on every run and fall back to sane defaults for anything unset.
+one setting per line), with per-server overrides in
+`~/.config/nordrassil/profiles/NAME.conf` (see [Profiles](#profiles)).
+Read/write it with `get`/`set`/`config`; commands read it back on every run and
+fall back to sane defaults for anything unset.
 
 | Key | Default | Notes |
 | --- | --- | --- |
@@ -177,6 +239,12 @@ back on every run and fall back to sane defaults for anything unset.
 | `K8S_STORAGE_TYPE` | `hostpath` | `hostpath` \| `storageclass` |
 | `K8S_DATA_HOSTPATH` / `K8S_DB_HOSTPATH` | `$SOURCE_DIR/data` / `/var/vanilla-wow-mariadb` | hostPath backing |
 | `K8S_STORAGECLASS` | (empty) | StorageClass name (empty = cluster default) |
+| `DB_TRANSPORT` / `SERVER_TRANSPORT` | `auto` / `auto` | see [Transports](#transports) |
+| `DB_SSH_HOST` / `SERVER_SSH_HOST` | (empty) | empty = local; otherwise run the orchestrator there over ssh |
+| `DB_POD_SELECTOR` | `app=vanilla-wow-mariadb` | label selector for the MariaDB pod |
+| `SERVER_POD_SELECTOR` | `app=vanilla-wow-server` | label selector for the mangosd pod |
+| `SERVER_K8S_CONTAINER` | (empty) | container in that pod; empty lets kubectl choose (and print "Defaulted container…") |
+| `SERVER_FIFO` | `/app/mangosd.stdin` | mangosd's console FIFO **inside** the container |
 
 ## Credits
 

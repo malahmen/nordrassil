@@ -153,6 +153,17 @@ trap 'echo "" >&2; warn "Interrupted."; exit 130' INT TERM
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nordrassil"
 CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
 CONFIG_FILE="${CONFIG_DIR}/nordrassil.conf"
+# PROFILES. One file per server, layered OVER nordrassil.conf: a key present
+# in the active profile wins, anything absent falls through to the base file.
+# That way shared settings (SOURCE_DIR, WOW_PATCH, rates) stay in one place
+# and a profile only carries what actually differs — which, for a remote
+# server, is the transports, the selectors and the credentials.
+#
+# Selected with --profile NAME or $NORDRASSIL_PROFILE. With none active, this
+# script behaves exactly as it did before profiles existed.
+PROFILE_DIR="${CONFIG_DIR}/profiles"
+PROFILE="${NORDRASSIL_PROFILE:-}"
+PROFILE_FILE=""
 BUILD_DIR="${CONFIG_DIR}/build"
 INSTALL_DIR="${CONFIG_DIR}/install"
 SRC_UNPACK_DIR="${CONFIG_DIR}/src"
@@ -192,9 +203,23 @@ ACE_DEPS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ace-wrappers/${ACE_BUILD_VERSION}/
 # script uses). Shared by cfg_set, the conf renderers and render_template.
 _sed_escape() { printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'; }
 
+# _cfg_has <file> <key> / _cfg_read <file> <key> — presence and value.
+# Presence rather than a non-empty value is what the layering tests, so a
+# profile can deliberately blank a key the base file sets (clearing an
+# inherited DB_SSH_HOST, say) instead of being unable to override it.
+_cfg_has()  { [[ -n "$1" ]] && grep -qE "^${2}=" "$1" 2>/dev/null; }
+_cfg_read() { grep -E "^${2}=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' || true; }
+
 cfg_get() {
-    grep -E "^${1}=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' || true
+    if _cfg_has "$PROFILE_FILE" "$1"; then
+        _cfg_read "$PROFILE_FILE" "$1"
+        return 0
+    fi
+    _cfg_read "$CONFIG_FILE" "$1"
 }
+
+# _cfg_target — the file 'set' writes to: the active profile, else the base.
+_cfg_target() { printf '%s' "${PROFILE_FILE:-$CONFIG_FILE}"; }
 cfg_set() {
     local key="$1" val="$2" quoted
     # The key is spliced into a regex and the value into a sed replacement;
@@ -202,13 +227,27 @@ cfg_set() {
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || error_exit "set: invalid key '${key}' (letters, digits, underscore)."
     [[ "$val" != *$'\n'* ]] || error_exit "set: ${key}: value must not contain a newline."
     quoted="\"${val}\""
-    touch "$CONFIG_FILE"
-    if grep -qE "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-        sed -i.bak "s|^${key}=.*|${key}=$(_sed_escape "$quoted")|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+    local file; file="$(_cfg_target)"
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    if grep -qE "^${key}=" "$file" 2>/dev/null; then
+        sed -i.bak "s|^${key}=.*|${key}=$(_sed_escape "$quoted")|" "$file" && rm -f "${file}.bak"
     else
-        echo "${key}=${quoted}" >> "$CONFIG_FILE"
+        echo "${key}=${quoted}" >> "$file"
     fi
 }
+# _profile_activate <name> — point the config layer at a profile.
+# The name becomes a filename, so it is restricted rather than trusted: no
+# slashes, no leading dot, which rules out traversal and dotfiles both.
+_profile_activate() {
+    local name="$1"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+        || error_exit "profile: invalid name '${name}' (letters, digits, then . _ - )."
+    [[ "$name" != *..* ]] || error_exit "profile: invalid name '${name}'."
+    PROFILE="$name"
+    PROFILE_FILE="${PROFILE_DIR}/${name}.conf"
+}
+
 cfg_default() {
     # cfg_default KEY DEFAULT — returns existing value or DEFAULT (does not persist)
     local val
@@ -243,6 +282,7 @@ SETTING_KEYS=(
     IMAGE_TAG SERVER_CONTAINER_NAME K8S_NAMESPACE CUSTOM_SQL
     K8S_STORAGE_TYPE K8S_DATA_HOSTPATH K8S_DB_HOSTPATH K8S_STORAGECLASS
     DB_TRANSPORT SERVER_TRANSPORT DB_POD_SELECTOR SERVER_POD_SELECTOR SERVER_FIFO
+    DB_SSH_HOST SERVER_SSH_HOST SERVER_K8S_CONTAINER
 )
 
 _settings() {
@@ -292,6 +332,21 @@ _settings() {
     # Where mangosd's console FIFO lives INSIDE the container. This repo's
     # image puts it at /app; kuat's azeroth image uses /opt/azeroth.
     SERVER_FIFO="$(cfg_default SERVER_FIFO /app/mangosd.stdin)"
+    # SSH is a THIRD axis, orthogonal to both transports: it says where the
+    # orchestrator runs, not which one. 'kubectl' + SERVER_SSH_HOST=meksha
+    # runs kubectl on meksha; 'podman' + DB_SSH_HOST=meksha runs podman
+    # there. Treating remoteness as another transport value would multiply
+    # the cases instead of adding one, and nothing about reaching a docker
+    # socket changes because the socket is on another machine.
+    #
+    # Empty means local. Needs key-based ssh: every call is BatchMode.
+    DB_SSH_HOST="$(cfg_default DB_SSH_HOST "")"
+    SERVER_SSH_HOST="$(cfg_default SERVER_SSH_HOST "")"
+    # Which container in the server pod holds mangosd. Empty lets kubectl
+    # pick, which is right but makes it print "Defaulted container ... out
+    # of: ..." to stderr on every single exec when the pod has init
+    # containers — noise on top of real output. Naming it silences that.
+    SERVER_K8S_CONTAINER="$(cfg_default SERVER_K8S_CONTAINER "")"
     REALM_ID="$(cfg_default REALM_ID 1)"
     REALM_PORT="$(cfg_default REALM_PORT 3724)"
     WORLD_PORT="$(cfg_default WORLD_PORT 8085)"
@@ -481,6 +536,100 @@ cmd_install_deps() {
 # used to insist on could not express that.
 # -----------------------------------------------------------------------------
 
+# _shq <string> — single-quote one argument for a remote POSIX shell.
+# _shq_argv <argv...> — the same for a whole command line.
+#
+# ssh does NOT take an argv. It joins its arguments with spaces and hands the
+# resulting STRING to a shell on the far side, which parses it again. So
+#   ssh h sh -c 'cat > /x'
+# arrives as `sh -c cat > /x` and the redirect happens in the login shell,
+# writing /x on the remote host instead of inside the container. Anything
+# sent over ssh has to be quoted for that second parse. Single quotes with
+# '\'' for embedded quotes is the POSIX-portable form; bash's printf %q is
+# not, and the remote end is whatever login shell the user has.
+_shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+_shq_argv() { local a q=""; for a in "$@"; do q+="$(_shq "$a") "; done; printf '%s' "$q"; }
+
+# _remote_run <host> <argv...> — run a command on another host. stdin is
+# forwarded; callers that must not consume it redirect </dev/null, the same
+# discipline as _db_client vs _db_client_stdin.
+_remote_run() {
+    local host="$1"; shift
+    ssh -o BatchMode=yes "$host" "$(_shq_argv "$@")"
+}
+
+# _remote_pw_run <host> <want_stdin> <password> <argv...> — as above, but
+# delivers a password through the remote shell's environment rather than its
+# argv, by sending it as the first line of stdin and having the far side
+# read exactly that one line. A password in a remote command string would be
+# visible in `ps` on that host, which is the thing the local paths already
+# take care to avoid.
+_remote_pw_run() {
+    local host="$1" want_stdin="$2" pw="$3"; shift 3
+    local remote="IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec $(_shq_argv "$@")"
+    if [[ -n "$want_stdin" ]]; then
+        { printf '%s\n' "$pw"; cat; } | ssh -o BatchMode=yes "$host" "$remote"
+    else
+        printf '%s\n' "$pw" | ssh -o BatchMode=yes "$host" "$remote"
+    fi
+}
+
+# _kube <ssh host or empty> <kubectl args...> — kubectl, here or there.
+# stdin is forwarded; see _remote_run.
+_kube() {
+    local host="$1"; shift
+    local ctx_flags; ctx_flags="$(kubectl_context_flag)"
+    if [[ -z "$host" ]]; then
+        command -v kubectl &>/dev/null || {
+            warn "kubectl not found on this host. Set DB_SSH_HOST/SERVER_SSH_HOST to run it on the server instead."
+            return 1
+        }
+        # shellcheck disable=SC2086
+        kubectl $ctx_flags "$@"
+    else
+        # shellcheck disable=SC2086
+        _remote_run "$host" kubectl $ctx_flags "$@"
+    fi
+}
+
+# _db_password — the password to authenticate with, prompting if asked to.
+#
+# DB_PASS=ask means "prompt, once per session, per profile". The answer is
+# cached in $XDG_RUNTIME_DIR, which is tmpfs, mode 0700 and owned by this
+# user: it survives for the login session and is gone on logout or reboot,
+# which is the lifetime wanted. With no XDG_RUNTIME_DIR there is nowhere
+# appropriate to put it, so it prompts every time rather than writing a
+# password into a persistent file.
+#
+# Prompting reads and writes /dev/tty, never stdin/stdout: callers run
+# queries inside $(...) and pipe SQL in, so a prompt on either would end up
+# captured as query output or eaten as SQL.
+_db_password() {
+    [[ "$DB_PASS" != "ask" ]] && { printf '%s' "$DB_PASS"; return 0; }
+
+    local cache=""
+    if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        install -d -m 0700 "${XDG_RUNTIME_DIR}/nordrassil" 2>/dev/null || true
+        cache="${XDG_RUNTIME_DIR}/nordrassil/${PROFILE:-default}.dbpass"
+        [[ -f "$cache" ]] && { cat "$cache"; return 0; }
+    fi
+
+    [[ -r /dev/tty && -w /dev/tty ]] || {
+        warn "DB_PASS=ask needs a terminal to prompt on, and there is none."
+        warn "  set DB_PASS explicitly for non-interactive use."
+        return 1
+    }
+    local pw
+    printf 'Database password for %s: ' "${PROFILE:-default}" >/dev/tty
+    IFS= read -rs pw </dev/tty
+    printf '\n' >/dev/tty
+    [[ -n "$pw" ]] || { warn "No password entered."; return 1; }
+    # umask in a subshell so the file cannot exist group/world-readable even
+    # momentarily between creation and a chmod.
+    [[ -n "$cache" ]] && ( umask 077; printf '%s' "$pw" >"$cache" )
+    printf '%s' "$pw"
+}
+
 # _kube_pick_pod <label selector> — one Running, non-terminating pod name.
 #
 # Deliberately NOT `jsonpath={.items[0].metadata.name}`, which is what the
@@ -491,16 +640,14 @@ cmd_install_deps() {
 # Running, so the phase alone is not enough; a deletionTimestamp is the thing
 # that distinguishes it, hence the two-field line and `NF==1`.
 _kube_pick_pod() {
-    local selector="$1" ctx_flags pod
-    command -v kubectl &>/dev/null || { warn "kubectl not found, needed for the kubectl transport."; return 1; }
-    ctx_flags="$(kubectl_context_flag)"
-    # shellcheck disable=SC2086
-    pod="$(kubectl $ctx_flags get pods -n "$K8S_NAMESPACE" -l "$selector" \
+    local selector="$1" host="${2:-}" pod
+    pod="$(_kube "$host" get pods -n "$K8S_NAMESPACE" -l "$selector" \
              --field-selector=status.phase=Running \
-             -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null \
+             -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' \
+             </dev/null 2>/dev/null \
            | awk 'NF==1{print $1; exit}')" || pod=""
     [[ -n "$pod" ]] || {
-        warn "No Running pod matching '${selector}' in namespace ${K8S_NAMESPACE}."
+        warn "No Running pod matching '${selector}' in namespace ${K8S_NAMESPACE}${host:+ on ${host}}."
         return 1
     }
     printf '%s' "$pod"
@@ -509,16 +656,24 @@ _kube_pick_pod() {
 # _db_transport — echoes the resolved DB transport, autodetecting when 'auto'.
 _db_transport() {
     case "$DB_TRANSPORT" in
-        docker|kubectl|tcp) printf '%s' "$DB_TRANSPORT"; return 0 ;;
+        docker|podman|kubectl|tcp) printf '%s' "$DB_TRANSPORT"; return 0 ;;
         auto) ;;
-        *) error_exit "DB_TRANSPORT must be auto|docker|kubectl|tcp (got '${DB_TRANSPORT}')." ;;
+        *) error_exit "DB_TRANSPORT must be auto|docker|podman|kubectl|tcp (got '${DB_TRANSPORT}')." ;;
     esac
+
+    # Probing across ssh would mean several round trips on every invocation,
+    # and guessing is the wrong default for a machine that is not this one.
+    [[ -z "$DB_SSH_HOST" ]] || error_exit \
+        "DB_TRANSPORT=auto cannot probe a remote host; set it to docker|podman|kubectl|tcp for DB_SSH_HOST=${DB_SSH_HOST}."
 
     # Probe order preserves the behaviour from before the split: the local
     # container was the only thing the DB helpers ever looked at, so it stays
     # first and an existing setup keeps working untouched.
     if [[ "$(docker inspect --type container "$DB_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]]; then
         printf 'docker'; return 0
+    fi
+    if [[ "$(podman inspect --type container "$DB_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]]; then
+        printf 'podman'; return 0
     fi
     if command -v kubectl &>/dev/null; then
         local ctx_flags; ctx_flags="$(kubectl_context_flag)"
@@ -533,8 +688,8 @@ _db_transport() {
     fi
 
     warn "No reachable database found."
-    warn "  checked: container '${DB_CONTAINER_NAME}', pods '${DB_POD_SELECTOR}' in ${K8S_NAMESPACE}, tcp ${DB_HOST}:${DB_PORT}"
-    warn "  set DB_TRANSPORT (docker|kubectl|tcp) and DB_HOST/DB_PORT to point at it explicitly."
+    warn "  checked: container '${DB_CONTAINER_NAME}' (docker, podman), pods '${DB_POD_SELECTOR}' in ${K8S_NAMESPACE}, tcp ${DB_HOST}:${DB_PORT}"
+    warn "  set DB_TRANSPORT (docker|podman|kubectl|tcp) and DB_HOST/DB_PORT to point at it explicitly."
     return 1
 }
 
@@ -575,16 +730,29 @@ _db_run() {
     if [[ -z "${_DB_T:-}" ]]; then
         _DB_T="$(_db_transport)" || return 1
     fi
+    local pw; pw="$(_db_password)" || return 1
+
     case "$_DB_T" in
-        docker)
-            if [[ -n "$want_stdin" ]]; then
-                MYSQL_PWD="$DB_PASS" docker exec -i -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" "$@"
+        docker|podman)
+            local -a cmd=( "$_DB_T" exec )
+            # -i only when the caller asked for stdin: see _db_client_stdin.
+            [[ -n "$want_stdin" ]] && cmd+=( -i )
+            cmd+=( -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" "$@" )
+            if [[ -z "$DB_SSH_HOST" ]]; then
+                # The password stays in this process's environment, never in
+                # argv — readable through /proc by this user and root, not by
+                # a casual `ps`.
+                if [[ -n "$want_stdin" ]]; then
+                    MYSQL_PWD="$pw" "${cmd[@]}"
+                else
+                    MYSQL_PWD="$pw" "${cmd[@]}" </dev/null
+                fi
             else
-                MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb -u"$DB_USER" "$@" </dev/null
+                _remote_pw_run "$DB_SSH_HOST" "$want_stdin" "$pw" "${cmd[@]}"
             fi
             ;;
         kubectl)
-            _kube_mariadb "$want_stdin" -u"$DB_USER" "$@"
+            _kube_mariadb "$want_stdin" "$pw" "$@"
             ;;
         tcp)
             # --ssl-verify-server-cert=0 is explicit rather than left to the
@@ -592,14 +760,12 @@ _db_run() {
             # to stderr on every single call. Saying it here keeps the output
             # of parsed queries clean and makes the choice visible: this is a
             # LAN connection to a server with no certificate of its own.
+            local -a cmd=( mariadb -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER"
+                           --ssl-verify-server-cert=0 "$@" )
             if [[ -n "$want_stdin" ]]; then
-                MYSQL_PWD="$DB_PASS" mariadb \
-                    -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER" \
-                    --ssl-verify-server-cert=0 "$@"
+                MYSQL_PWD="$pw" "${cmd[@]}"
             else
-                MYSQL_PWD="$DB_PASS" mariadb \
-                    -h"$DB_HOST" -P"$DB_PORT" -u"$DB_USER" \
-                    --ssl-verify-server-cert=0 "$@" </dev/null
+                MYSQL_PWD="$pw" "${cmd[@]}" </dev/null
             fi
             ;;
     esac
@@ -1272,15 +1438,20 @@ _server_transport() {
     # happens to reach, and "where is mangosd running" is not the same
     # question as "which deployment am I administering".
     case "$SERVER_TRANSPORT" in
-        local|docker|kubectl) printf '%s' "$SERVER_TRANSPORT"; return 0 ;;
+        local|docker|podman|kubectl) printf '%s' "$SERVER_TRANSPORT"; return 0 ;;
         auto) ;;
-        *) error_exit "SERVER_TRANSPORT must be auto|local|docker|kubectl (got '${SERVER_TRANSPORT}')." ;;
+        *) error_exit "SERVER_TRANSPORT must be auto|local|docker|podman|kubectl (got '${SERVER_TRANSPORT}')." ;;
     esac
+
+    [[ -z "$SERVER_SSH_HOST" ]] || error_exit \
+        "SERVER_TRANSPORT=auto cannot probe a remote host; set it to docker|podman|kubectl for SERVER_SSH_HOST=${SERVER_SSH_HOST}."
 
     local -a targets=()
     pf_is_running "${PF_DIR}/mangosd.pid" && targets+=("local")
     [[ "$(docker inspect --type container "$SERVER_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]] \
         && targets+=("docker")
+    [[ "$(podman inspect --type container "$SERVER_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null)" == "running" ]] \
+        && targets+=("podman")
     if command -v kubectl &>/dev/null; then
         # Same --context/--kind target as the exec path, otherwise detection
         # looks at the ambient context while the command goes to another.
@@ -1292,8 +1463,8 @@ _server_transport() {
 
     if [[ ${#targets[@]} -eq 0 ]]; then
         warn "mangosd doesn't appear to be running anywhere."
-        warn "  checked: local pidfile, container '${SERVER_CONTAINER_NAME}', pods '${SERVER_POD_SELECTOR}' in ${K8S_NAMESPACE}"
-        warn "  set SERVER_TRANSPORT (local|docker|kubectl) to name it explicitly."
+        warn "  checked: local pidfile, container '${SERVER_CONTAINER_NAME}' (docker, podman), pods '${SERVER_POD_SELECTOR}' in ${K8S_NAMESPACE}"
+        warn "  set SERVER_TRANSPORT (local|docker|podman|kubectl) to name it explicitly."
         return 1
     fi
 
@@ -1314,7 +1485,7 @@ _server_transport() {
 
     # Confirm a pod is addressable before the caller commits to it.
     if [[ "$chosen" == "kubectl" ]]; then
-        _kube_pick_pod "$SERVER_POD_SELECTOR" >/dev/null || return 1
+        _kube_pick_pod "$SERVER_POD_SELECTOR" "$SERVER_SSH_HOST" >/dev/null || return 1
     fi
 
     printf '%s' "$chosen"
@@ -1330,30 +1501,20 @@ _sql_escape() { printf '%s' "$1" | sed -e "s/\\\\/\\\\\\\\/g" -e "s/'/\\\\'/g"; 
 # argument would put it right back in this host's 'ps' output (see the note
 # above _db_exec). None of the callers need stdin for anything else.
 _kube_mariadb() {
-    local want_stdin="$1"; shift
-    local ctx_flags pod
-    ctx_flags="$(kubectl_context_flag)"
-    pod="$(_kube_pick_pod "$DB_POD_SELECTOR")" || return 1
-    # The password arrives as the FIRST LINE of stdin and is consumed by a
-    # single POSIX `read`, which is specified not to consume past the newline
-    # — so whatever follows is still intact for the client on stdin. That
-    # matters: the previous version piped the password as the WHOLE of stdin,
-    # which silently made it impossible to feed SQL in this way, so
-    # _db_import had no kubectl path at all.
-    #
-    # Still not in argv, which is the point (see the note above _db_exec).
-    #
-    # `cat` only when the caller asked for stdin: otherwise it would drain
-    # whatever stdin is connected, which is the same hazard that makes
-    # `docker exec -i` unsafe here (see _db_client_stdin).
+    local want_stdin="$1" pw="$2"; shift 2
+    local pod; pod="$(_kube_pick_pod "$DB_POD_SELECTOR" "$DB_SSH_HOST")" || return 1
+    # The password is the first line of stdin, consumed inside the pod by one
+    # POSIX `read` — specified not to read past the newline, so anything
+    # after it is still intact for the client. The previous version piped the
+    # password as the WHOLE of stdin, which silently left _db_import with no
+    # kubectl path at all. Not in argv, which is the point.
+    local inner='IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec "$@"'
+    local -a cmd=( exec -i -n "$K8S_NAMESPACE" "$pod" --
+                   sh -c "$inner" _ mariadb -u"$DB_USER" "$@" )
     if [[ -n "$want_stdin" ]]; then
-        # shellcheck disable=SC2086
-        { printf '%s\n' "$DB_PASS"; cat; } | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- \
-            sh -c 'IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec "$@"' _ mariadb "$@"
+        { printf '%s\n' "$pw"; cat; } | _kube "$DB_SSH_HOST" "${cmd[@]}"
     else
-        # shellcheck disable=SC2086
-        printf '%s\n' "$DB_PASS" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- \
-            sh -c 'IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec "$@"' _ mariadb "$@"
+        printf '%s\n' "$pw" | _kube "$DB_SSH_HOST" "${cmd[@]}"
     fi
 }
 
@@ -1384,16 +1545,21 @@ _send_console_cmd() {
             fi
             printf '%s\n' "$line" > "$fifo"
             ;;
-        docker)
-            printf '%s\n' "$line" | docker exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > ${SERVER_FIFO}" \
-                || { warn "Failed to reach the container's console FIFO (${SERVER_FIFO})."; return 1; }
+        docker|podman)
+            if [[ -z "$SERVER_SSH_HOST" ]]; then
+                printf '%s\n' "$line" | "$tgt" exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > ${SERVER_FIFO}" \
+                    || { warn "Failed to reach the container's console FIFO (${SERVER_FIFO})."; return 1; }
+            else
+                printf '%s\n' "$line" | _remote_run "$SERVER_SSH_HOST" \
+                    "$tgt" exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > ${SERVER_FIFO}" \
+                    || { warn "Failed to reach the container's console FIFO (${SERVER_FIFO}) on ${SERVER_SSH_HOST}."; return 1; }
+            fi
             ;;
         kubectl)
-            local ctx_flags pod
-            ctx_flags="$(kubectl_context_flag)"
-            pod="$(_kube_pick_pod "$SERVER_POD_SELECTOR")" || return 1
-            # shellcheck disable=SC2086
-            printf '%s\n' "$line" | kubectl $ctx_flags exec -i -n "$K8S_NAMESPACE" "$pod" -- sh -c "cat > ${SERVER_FIFO}" \
+            local pod
+            pod="$(_kube_pick_pod "$SERVER_POD_SELECTOR" "$SERVER_SSH_HOST")" || return 1
+            printf '%s\n' "$line" | _kube "$SERVER_SSH_HOST" \
+                exec -i -n "$K8S_NAMESPACE" ${SERVER_K8S_CONTAINER:+-c "$SERVER_K8S_CONTAINER"} "$pod" -- sh -c "cat > ${SERVER_FIFO}" \
                 || { warn "Failed to reach the pod's console FIFO (${SERVER_FIFO})."; return 1; }
             ;;
     esac
@@ -2130,7 +2296,50 @@ cmd_get() {
 # this to pre-fill its prompts with the current values.
 cmd_config() {
     _settings
+    # Both layers, separately rather than merged: when a value is surprising
+    # the useful question is which file it came from.
+    if [[ -n "$PROFILE" ]]; then
+        info "profile: ${PROFILE}  (${PROFILE_FILE})"
+        if [[ -f "$PROFILE_FILE" ]]; then cat "$PROFILE_FILE"; else info "  (empty)"; fi
+        info "base: ${CONFIG_FILE}"
+    fi
     [[ -f "$CONFIG_FILE" ]] && cat "$CONFIG_FILE" || info "No config yet at ${CONFIG_FILE}."
+}
+
+# Drops the cached database password for the active profile (all of them
+# with --all), so the next command prompts again.
+cmd_forget() {
+    local all=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --all) all=1; shift ;;
+        *) error_exit "forget: unknown flag: $1" ;;
+    esac; done
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] || { info "Nothing cached (no XDG_RUNTIME_DIR)."; return; }
+    local dir="${XDG_RUNTIME_DIR}/nordrassil"
+    if [[ "$all" -eq 1 ]]; then
+        rm -f "${dir}"/*.dbpass 2>/dev/null || true
+        success "Forgot every cached database password."
+    else
+        rm -f "${dir}/${PROFILE:-default}.dbpass" 2>/dev/null || true
+        success "Forgot the cached database password for ${PROFILE:-default}."
+    fi
+}
+
+# Lists the profiles in PROFILE_DIR, marking the active one.
+cmd_profiles() {
+    [[ -d "$PROFILE_DIR" ]] || { info "No profiles yet. Create one with: --profile NAME set KEY VALUE"; return; }
+    local f name found=0
+    for f in "$PROFILE_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        name="$(basename "$f" .conf)"
+        if [[ "$name" == "$PROFILE" ]]; then
+            printf '* %s\n' "$name"
+        else
+            printf '  %s\n' "$name"
+        fi
+        found=1
+    done
+    [[ "$found" -eq 1 ]] || info "No profiles yet. Create one with: --profile NAME set KEY VALUE"
 }
 
 # Lists the Custom SQL files available to 'configure --custom' (basenames, no
@@ -2207,18 +2416,55 @@ Transports (where this script looks for the server and the database):
   set SERVER_FIFO              mangosd's console FIFO inside the container
                                (default /app/mangosd.stdin)
 
-  The kubectl transports need kubectl on THIS host; tcp needs a mariadb
-  client. --where still selects between several running servers.
+  SSH is a third, orthogonal axis — it says WHERE the orchestrator runs,
+  not which one, so remote k8s needs no kubectl on this machine:
+
+  set DB_SSH_HOST / SERVER_SSH_HOST    empty = local; needs key-based ssh
+
+  With an ssh host set, the transport must be explicit: 'auto' will not
+  probe across a network. tcp needs a mariadb client here.
+  --where still selects between several running servers.
+
+Profiles (one per server):
+  --profile NAME <command>        or $NORDRASSIL_PROFILE
+  profiles                        list them, marking the active one
+  forget [--all]                  drop the cached database password
+
+  A profile is $CONFIG_DIR/profiles/NAME.conf, layered OVER nordrassil.conf:
+  a key present in the profile wins, anything absent falls through. So
+  shared settings stay in one place and a profile carries only what differs.
+  'set' writes to the active profile, or to the base file when none is.
+
+  DB_PASS=ask prompts once per session per profile, cached in
+  $XDG_RUNTIME_DIR (tmpfs, 0600, gone on logout). 'forget' clears it.
+
+  A worked example — k8s server on another host, its MariaDB in podman
+  beside it, driven from a machine with neither kubectl nor the password:
+
+    --profile meksha set DB_TRANSPORT podman
+    --profile meksha set DB_SSH_HOST meksha
+    --profile meksha set DB_CONTAINER_NAME mariadb
+    --profile meksha set DB_PASS ask
+    --profile meksha set SERVER_TRANSPORT kubectl
+    --profile meksha set SERVER_SSH_HOST meksha
+    --profile meksha set K8S_NAMESPACE azeroth
+    --profile meksha set SERVER_POD_SELECTOR app=azeroth
+    --profile meksha set SERVER_K8S_CONTAINER azeroth
+    --profile meksha set SERVER_FIFO /opt/azeroth/mangosd.stdin
 
   help | -h | --help
 EOF
 }
 
 main() {
-    # Global flags first (kube target), then the subcommand.
+    # $NORDRASSIL_PROFILE first so an explicit --profile can still override it.
+    [[ -n "$PROFILE" ]] && _profile_activate "$PROFILE"
+
+    # Global flags first (kube target, profile), then the subcommand.
     while [[ $# -gt 0 ]]; do case "$1" in
         --context) KUBE_CONTEXT="$2"; shift 2 ;;
         --kind)    KIND_CLUSTER="$2"; shift 2 ;;
+        --profile) _profile_activate "$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         --) shift; break ;;
         -*) error_exit "Unknown global flag: $1" ;;
@@ -2250,6 +2496,8 @@ main() {
         get)                cmd_get "$@" ;;
         config)             cmd_config "$@" ;;
         list-custom)        cmd_list_custom "$@" ;;
+        profiles)           cmd_profiles "$@" ;;
+        forget)             cmd_forget "$@" ;;
         -h|--help|help)     usage ;;
         *) error_exit "Unknown command: $cmd (run with --help for usage)" ;;
     esac
