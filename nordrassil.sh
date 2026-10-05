@@ -657,6 +657,22 @@ _kube_pick_pod() {
     printf '%s' "$pod"
 }
 
+# _container_state <docker|podman> <ssh host or empty> <name> — a container's
+# status, asked of the engine that actually holds it. --type container because
+# SERVER_CONTAINER_NAME and IMAGE_TAG share a base name and a plain inspect
+# falls back to matching images, which would report an unrelated image's state
+# instead of "not created".
+_container_state() {
+    local engine="$1" host="$2" name="$3" out
+    if [[ -z "$host" ]]; then
+        out="$("$engine" inspect --type container "$name" --format='{{.State.Status}}' 2>/dev/null)" || out=""
+    else
+        out="$(_remote_run "$host" "$engine" inspect --type container "$name" \
+                 --format='{{.State.Status}}' </dev/null 2>/dev/null)" || out=""
+    fi
+    printf '%s' "${out:-not created}"
+}
+
 # _db_transport — echoes the resolved DB transport, autodetecting when 'auto'.
 _db_transport() {
     case "$DB_TRANSPORT" in
@@ -1395,22 +1411,86 @@ cmd_status() {
     header "nordrassil — Status"
     _settings
 
-    _section "Local MariaDB"
-    docker inspect --type container "$DB_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null || warn "Not created."
+    # This used to probe local docker unconditionally — `docker inspect` for
+    # the database, the server container and the image — which predates
+    # transports and was never migrated with the rest. The effect was that
+    # status looked IDENTICAL for every profile and could never show a
+    # correctly configured remote database as reachable, which reads exactly
+    # like switching profiles having no effect.
+    _section "Acting on"
+    info "profile:  ${PROFILE:-<base config>}"
 
-    _section "Local native processes"
-    pf_is_running "${PF_DIR}/realmd.pid"  && success "realmd running (port $(pf_port "${PF_DIR}/realmd.pid"))"  || info "realmd not running."
-    pf_is_running "${PF_DIR}/mangosd.pid" && success "mangosd running (port $(pf_port "${PF_DIR}/mangosd.pid"))" || info "mangosd not running."
+    local dbt srvt
+    dbt="$(_db_transport)" || dbt=""
+    srvt="$(_server_transport)" || srvt=""
+    # The ssh host is only shown where it is actually used. 'tcp' connects
+    # straight to DB_HOST:DB_PORT and 'local' runs here, so naming an ssh
+    # host alongside either would claim a hop that does not happen — and a
+    # leftover *_SSH_HOST from an earlier transport is worth pointing out
+    # rather than displaying as if it were in effect.
+    local db_via="" srv_via=""
+    case "$dbt" in docker|podman|kubectl) [[ -n "$DB_SSH_HOST" ]] && db_via=" on ${DB_SSH_HOST} (ssh)" ;; esac
+    case "$srvt" in docker|podman|kubectl) [[ -n "$SERVER_SSH_HOST" ]] && srv_via=" on ${SERVER_SSH_HOST} (ssh)" ;; esac
+    info "database: ${dbt:-<unresolved>}${db_via}"
+    info "server:   ${srvt:-<unresolved>}${srv_via}"
+    [[ "$dbt" == tcp && -n "$DB_SSH_HOST" ]] \
+        && info "          (DB_SSH_HOST=${DB_SSH_HOST} is unused by the tcp transport)"
+    [[ "$srvt" == local && -n "$SERVER_SSH_HOST" ]] \
+        && info "          (SERVER_SSH_HOST=${SERVER_SSH_HOST} is unused by the local transport)"
 
-    # --type container: SERVER_CONTAINER_NAME and IMAGE_TAG share a base
-    # name ("vanilla-wow-server"), and plain 'docker inspect' falls back to
-    # matching images when no container matches — without this it would
-    # always report the image's (unrelated) state here instead of "Not created".
-    _section "Server container"
-    docker inspect --type container "$SERVER_CONTAINER_NAME" --format='{{.State.Status}}' 2>/dev/null || info "Not created."
+    _section "Database"
+    case "$dbt" in
+        docker|podman) info "${dbt} container '${DB_CONTAINER_NAME}': $(_container_state "$dbt" "$DB_SSH_HOST" "$DB_CONTAINER_NAME")" ;;
+        kubectl)       info "pod '${DB_POD_SELECTOR}' in ${K8S_NAMESPACE}: $(_kube_pick_pod "$DB_POD_SELECTOR" "$DB_SSH_HOST" 2>/dev/null || echo 'none Running')" ;;
+        tcp)           info "endpoint ${DB_HOST}:${DB_PORT}" ;;
+        *)             warn "No database transport resolved (see above)." ;;
+    esac
+    if [[ -n "$dbt" ]]; then
+        # The actual test. Everything above only says whether the thing
+        # HOLDING the database can be reached; this says whether the database
+        # answers as this user, which is what a wrong connection gets wrong.
+        local ver
+        if ver="$(_db_query_raw 'SELECT VERSION();' 2>/dev/null)" && [[ -n "$ver" ]]; then
+            success "connected as '${DB_USER}' — MariaDB ${ver}"
+            local present=""
+            local d
+            for d in "${NORDRASSIL_DBS[@]}"; do
+                [[ -n "$(_db_query_raw "SHOW DATABASES LIKE '$(_sql_escape "$d")';" 2>/dev/null)" ]] \
+                    && present+="${d} " || present+="${d}(missing) "
+            done
+            info "databases: ${present}"
+        else
+            warn "could NOT query the database as '${DB_USER}'."
+            warn "  DB_TRANSPORT=${DB_TRANSPORT} DB_SSH_HOST=${DB_SSH_HOST:-<local>} DB_USER=${DB_USER}"
+            warn "  tcp also needs DB_HOST/DB_PORT; docker/podman need DB_CONTAINER_NAME."
+        fi
+    fi
 
-    _section "Docker image"
-    docker image inspect "$IMAGE_TAG" --format='{{.Id}}' 2>/dev/null || info "Not built."
+    _section "Server"
+    case "$srvt" in
+        local)
+            pf_is_running "${PF_DIR}/realmd.pid"  && success "realmd running (port $(pf_port "${PF_DIR}/realmd.pid"))"  || info "realmd not running."
+            pf_is_running "${PF_DIR}/mangosd.pid" && success "mangosd running (port $(pf_port "${PF_DIR}/mangosd.pid"))" || info "mangosd not running."
+            ;;
+        docker|podman)
+            info "${srvt} container '${SERVER_CONTAINER_NAME}': $(_container_state "$srvt" "$SERVER_SSH_HOST" "$SERVER_CONTAINER_NAME")"
+            ;;
+        kubectl)
+            local pod
+            if pod="$(_kube_pick_pod "$SERVER_POD_SELECTOR" "$SERVER_SSH_HOST" 2>/dev/null)"; then
+                success "pod ${pod} Running in ${K8S_NAMESPACE}"
+            else
+                warn "no Running pod matching '${SERVER_POD_SELECTOR}' in ${K8S_NAMESPACE}"
+            fi
+            ;;
+        *) warn "No server transport resolved (see above)." ;;
+    esac
+
+    # Only meaningful for a server this host builds and runs itself.
+    if [[ -z "$SERVER_SSH_HOST" && "$srvt" != "kubectl" ]]; then
+        _section "Local docker image"
+        docker image inspect "$IMAGE_TAG" --format='{{.Id}}' 2>/dev/null || info "Not built."
+    fi
 
     # realmlist.wtf syntax: 'set realmlist <address>[:<port>]' — the port
     # suffix is only needed when it's non-standard, the client already
