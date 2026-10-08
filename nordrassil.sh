@@ -207,6 +207,17 @@ ACE_DEPS_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ace-wrappers/${ACE_BUILD_VERSION}/
 # script uses). Shared by cfg_set, the conf renderers and render_template.
 _sed_escape() { printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'; }
 
+# _mkdir_private <dir> — create it owner-only. For PROFILE_DIR and DUMP_DIR: a
+# profile carries DB_PASS and a dump of realmd carries every account row, and
+# both were made 0755 with 0644 files in them.
+#
+# Deliberately NOT used for CONFIG_DIR itself. ETC_DIR lives under it and its
+# rendered conf files are bind-mounted into the server container, which may run
+# as another uid — and traversing to a mount source needs search permission on
+# every parent directory. Tightening the two directories that hold secrets
+# costs nothing; tightening their parent would break 'run-docker'.
+_mkdir_private() { mkdir -p "$1"; chmod 700 "$1" 2>/dev/null || true; }
+
 # _cfg_has <file> <key> / _cfg_read <file> <key> — presence and value.
 # Presence rather than a non-empty value is what the layering tests, so a
 # profile can deliberately blank a key the base file sets (clearing an
@@ -230,10 +241,25 @@ cfg_set() {
     # the file is one key=value per line, so neither may carry a newline.
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || error_exit "set: invalid key '${key}' (letters, digits, underscore)."
     [[ "$val" != *$'\n'* ]] || error_exit "set: ${key}: value must not contain a newline."
+    # Validated on the way IN as well as on the way out. _settings reads this
+    # key and used to error_exit on anything but 0 or 1 — and _settings runs
+    # first in every command, 'set' included, so one 'set MANAGED_EXTERNALLY
+    # yes' left no command able to correct it. The read side now fails safe
+    # instead of fatally (see _settings); this stops the bad value being
+    # stored at all.
+    [[ "$key" != "MANAGED_EXTERNALLY" || "$val" =~ ^[01]$ ]] \
+        || error_exit "set: MANAGED_EXTERNALLY must be 0 or 1 (got '${val}') — 1 means something else provisions this server."
     quoted="\"${val}\""
-    local file; file="$(_cfg_target)"
-    mkdir -p "$(dirname "$file")"
+    local file dir; file="$(_cfg_target)"; dir="$(dirname "$file")"
+    # Only PROFILE_DIR is tightened. The base file's directory IS CONFIG_DIR,
+    # and ETC_DIR under it holds the rendered conf files that get bind-mounted
+    # into the server container — which may run as another uid, and needs
+    # search permission on every parent of a mount source. Caught by a test
+    # asserting CONFIG_DIR stays traversable.
+    if [[ "$dir" == "$PROFILE_DIR" ]]; then _mkdir_private "$dir"; else mkdir -p "$dir"; fi
     touch "$file"
+    # DB_PASS is stored here. The file was 0644, and so was every profile.
+    chmod 600 "$file" 2>/dev/null || true
     if grep -qE "^${key}=" "$file" 2>/dev/null; then
         sed -i.bak "s|^${key}=.*|${key}=$(_sed_escape "$quoted")|" "$file" && rm -f "${file}.bak"
     else
@@ -250,6 +276,52 @@ _profile_activate() {
     [[ "$name" != *..* ]] || error_exit "profile: invalid name '${name}'."
     PROFILE="$name"
     PROFILE_FILE="${PROFILE_DIR}/${name}.conf"
+}
+
+# _profile_deactivate — back to the base config, whatever the environment says.
+# $NORDRASSIL_PROFILE is read at startup, so without this there was no way to
+# ask for the base file from a shell that exports one: the front-end's "base
+# config (no profile)" entry acted on the exported profile instead.
+_profile_deactivate() { PROFILE=""; PROFILE_FILE=""; }
+
+# _profile_names — the profiles that exist, one per line.
+_profile_names() {
+    local f
+    for f in "$PROFILE_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        basename "$f" .conf
+    done
+}
+
+# _profile_require <command> — refuse to run a command with a profile whose
+# file does not exist.
+#
+# _profile_activate only validates the NAME, because the file is allowed not to
+# exist yet: '--profile new set KEY VALUE' is how a profile is created. The
+# price of that was silent fallthrough — cfg_get checks the profile for a key,
+# does not find the file, and reads the base config instead. So a typo did not
+# fail; it acted on a DIFFERENT SERVER and exited 0. Measured:
+# '--profile mekhsa restore --yes' restored over the local tcp database with
+# the base password, reporting success.
+#
+# The check lives here, where the command is known, rather than in
+# _profile_activate: 'set' may create a profile, 'profiles' is how you find out
+# what the name should have been, and nothing else may act on one that is not
+# there.
+_profile_require() {
+    [[ -n "$PROFILE" ]] || return 0
+    [[ -f "$PROFILE_FILE" ]] && return 0
+    case "$1" in
+        set)                   info "profile '${PROFILE}': creating ${PROFILE_FILE}"; return 0 ;;
+        profiles|help|-h|--help) return 0 ;;
+    esac
+    warn "No such profile: '${PROFILE}' — ${PROFILE_FILE} does not exist."
+    warn "'${1}' would otherwise have run against the base config (${CONFIG_FILE}):"
+    warn "its transport, its credentials, its server — and exited 0."
+    local have; have="$(_profile_names | tr '\n' ' ')"
+    [[ -n "${have// /}" ]] && warn "Profiles that do exist: ${have}" \
+                           || warn "No profiles exist yet. Create one with: --profile ${PROFILE} set KEY VALUE"
+    error_exit "Refusing to run '${1}' with a profile that does not exist."
 }
 
 cfg_default() {
@@ -358,10 +430,20 @@ _settings() {
     #
     # Validated strictly rather than tested for truthiness. The dangerous
     # direction is a typo reading as "not managed", so anything that is not
-    # exactly 0 or 1 is an error instead of quietly meaning off.
+    # exactly 0 or 1 is treated as 1 — provisioning refused.
+    #
+    # Treated, not rejected: this check used to error_exit, and _settings runs
+    # before anything else in every command, so a stored 'yes' took out the
+    # whole tool — 'set MANAGED_EXTERNALLY 0' died here too, which left the
+    # config file and an editor as the only way back. cfg_set now refuses the
+    # value outright, so this path only exists for a file that is already in
+    # that state, or one edited by hand.
     MANAGED_EXTERNALLY="$(cfg_default MANAGED_EXTERNALLY 0)"
-    [[ "$MANAGED_EXTERNALLY" =~ ^[01]$ ]] \
-        || error_exit "MANAGED_EXTERNALLY must be 0 or 1 (got '${MANAGED_EXTERNALLY}')."
+    if [[ ! "$MANAGED_EXTERNALLY" =~ ^[01]$ ]]; then
+        warn "MANAGED_EXTERNALLY='${MANAGED_EXTERNALLY}' is not 0 or 1 — treating it as 1, so provisioning is refused."
+        warn "Fix it with: ${0##*/} ${PROFILE:+--profile ${PROFILE} }set MANAGED_EXTERNALLY 0"
+        MANAGED_EXTERNALLY=1
+    fi
     REALM_ID="$(cfg_default REALM_ID 1)"
     REALM_PORT="$(cfg_default REALM_PORT 3724)"
     WORLD_PORT="$(cfg_default WORLD_PORT 8085)"
@@ -745,6 +827,29 @@ _refuse_if_managed() {
 # _db_require — resolve the transport for its side effects only, so a command
 # fails with a useful message before it starts prompting for arguments.
 _db_require() { _db_transport >/dev/null; }
+
+# _announce_db_target <resolved transport> — name the server about to be
+# written to, before writing to it.
+#
+# The other half of the mistyped-profile problem. 'restore', 'apply-sql' and
+# 'dump' each printed their file and their database and never the machine, so
+# a restore into the wrong server produced output indistinguishable from a
+# restore into the right one. Printed from the RESOLVED transport, not the
+# configured one, so 'auto' reports what it actually picked.
+_announce_db_target() {
+    local t="$1" where=""
+    case "$t" in
+        docker|podman) where="container '${DB_CONTAINER_NAME}'" ;;
+        kubectl)       where="pod '${DB_POD_SELECTOR}' in ${K8S_NAMESPACE}" ;;
+        tcp)           where="${DB_HOST}:${DB_PORT}" ;;
+        *)             where="<unresolved>" ;;
+    esac
+    # Same rule as status: the ssh hop is shown only where it is used, since
+    # tcp connects straight to DB_HOST and naming a host there would claim a
+    # hop that does not happen.
+    [[ -n "$DB_SSH_HOST" && "$t" != tcp ]] && where="${where} on ${DB_SSH_HOST} (ssh)"
+    warn "target:   ${PROFILE:-<base config>} — ${t} ${where}, as ${DB_USER}"
+}
 
 # _db_client <mariadb args...> — runs the mariadb client against the
 # configured database, whatever it takes to reach it. stdin is passed through,
@@ -2516,7 +2621,9 @@ cmd_apply_sql() {
     # name is restricted instead.
     [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || error_exit "apply-sql: --db '${db}' is not a valid database name."
 
-    _db_require || return 1
+    local dbt
+    dbt="$(_db_transport)" || return 1
+    _announce_db_target "$dbt"
 
     local sum name
     sum="$(sha256sum "$file" | cut -c1-12)"
@@ -2682,7 +2789,9 @@ cmd_dump() {
         dbs=( "$db" )
     fi
 
-    _db_require || return 1
+    local dbt
+    dbt="$(_db_transport)" || return 1
+    _announce_db_target "$dbt"
 
     # Each database is checked before anything is written: mariadb-dump on a
     # missing one fails only after emitting part of its output, which would
@@ -2712,6 +2821,9 @@ cmd_dump() {
         local what; if [[ "$all" -eq 1 ]]; then what="all"; elif [[ -n "$tables" ]]; then what="${db}-tables"; else what="$db"; fi
         out="${DUMP_DIR}/${PROFILE:-default}-${what}-$(date +%Y%m%d-%H%M%S).sql"
         [[ "$gz" -eq 1 ]] && out="${out}.gz"
+        # Only the default location is tightened. An explicit --out is the
+        # caller's directory and not this script's business to re-mode.
+        _mkdir_private "$DUMP_DIR"
     fi
     out="${out/#\~/$HOME}"
     mkdir -p "$(dirname "$out")"
@@ -2732,11 +2844,11 @@ cmd_dump() {
         # that named its own database could not do that.
         #
         # --events/--routines are database-level and meaningless here.
-        dargs=( --single-transaction --quick "$db" "${tbl[@]}" )
+        dargs=( --single-transaction --quick --default-character-set=utf8mb4 "$db" "${tbl[@]}" )
         info "tables:    ${tbl[*]}"
         info "note:      a table dump names no database — restore it with --db ${db}"
     else
-        dargs=( --single-transaction --quick --events --routines --databases "${dbs[@]}" )
+        dargs=( --single-transaction --quick --default-character-set=utf8mb4 --events --routines --databases "${dbs[@]}" )
     fi
 
     # Written to .partial and renamed only on success, so a dump that fails
@@ -2745,12 +2857,38 @@ cmd_dump() {
     # failure instead of reporting gzip's own happy exit.
     local tmp="${out}.partial"
     rm -f "$tmp"
+    # Created 0600 before the write rather than chmod'ed after, so it is never
+    # briefly world-readable: a realmd dump carries every account row. The
+    # redirections below truncate this file, which keeps its mode, and the mv
+    # keeps it too.
+    ( umask 077; : >"$tmp" )
     if [[ "$gz" -eq 1 ]]; then
         _db_dump "${dargs[@]}" | gzip -c >"$tmp" || { rm -f "$tmp"; error_exit "dump: failed — nothing written."; }
     else
         _db_dump "${dargs[@]}" >"$tmp" || { rm -f "$tmp"; error_exit "dump: failed — nothing written."; }
     fi
     [[ -s "$tmp" ]] || { rm -f "$tmp"; error_exit "dump: produced an empty file."; }
+
+    # The output is believed only if it reads like a dump. For every transport
+    # but tcp the stream crosses docker/podman/kubectl exec or ssh, and
+    # anything else that writes to that stdout — an rc file's echo, a banner,
+    # a "Defaulted container" notice — lands in the file AHEAD of the dump and
+    # makes it unrestorable. The first line is the test, not a match anywhere
+    # in the head, because prepended noise is exactly the failure: mariadb-dump
+    # opens with '-- MariaDB dump ...'. restore applies the same test on the
+    # way back in; catching it here means finding out now rather than during a
+    # recovery.
+    local first=""
+    if [[ "$gz" -eq 1 ]]; then
+        first="$(gzip -dc "$tmp" 2>/dev/null | head -1)" || true
+    else
+        first="$(head -1 "$tmp")" || true
+    fi
+    [[ "$first" == --* || "$first" == /\** ]] || {
+        rm -f "$tmp"
+        warn "first line: ${first}"
+        error_exit "dump: the output does not start like a SQL dump — something else wrote to the stream (a login shell on ${DB_SSH_HOST:-this host}?). Nothing written."
+    }
     mv -f "$tmp" "$out"
 
     success "Dumped ${dbs[*]} to ${out} ($(du -h "$out" | cut -f1))."
@@ -2803,13 +2941,17 @@ cmd_restore() {
     fi
     [[ -n "${targets// /}" ]] || error_exit "restore: the dump names no database — pass --db NAME to say where it goes."
 
+    # Resolved before the --yes gate, not after it, so the machine is named in
+    # the same breath as the databases it would overwrite.
+    local dbt
+    dbt="$(_db_transport)" || return 1
+
     info "file:   ${file}"
     info "reader: ${reader}"
+    _announce_db_target "$dbt"
     warn "OVERWRITES: ${targets}"
 
-    [[ "$yes" -eq 1 ]] || error_exit "restore: refusing without --yes. This REPLACES the data in: ${targets}"
-
-    _db_require || return 1
+    [[ "$yes" -eq 1 ]] || error_exit "restore: refusing without --yes. This REPLACES the data in: ${targets} — on ${PROFILE:-<base config>} (${dbt})."
 
     # A running mangosd caches world data and holds character state in
     # memory, so after a restore it disagrees with its own database until it
@@ -2952,6 +3094,7 @@ Transports (where this script looks for the server and the database):
 
 Profiles (one per server):
   --profile NAME <command>        or $NORDRASSIL_PROFILE
+  --no-profile <command>          the base config, ignoring $NORDRASSIL_PROFILE
   profiles                        list them, marking the active one
   forget [--all]                  drop the cached database password
 
@@ -2959,6 +3102,9 @@ Profiles (one per server):
   a key present in the profile wins, anything absent falls through. So
   shared settings stay in one place and a profile carries only what differs.
   'set' writes to the active profile, or to the base file when none is.
+  A profile that does not exist is an error for every command but 'set',
+  which creates it: otherwise a typo would act on the base config instead.
+  Profiles and dumps are 0600 in 0700 directories — both hold secrets.
 
   DB_PASS=ask prompts once per session per profile, cached in
   $XDG_RUNTIME_DIR (tmpfs, 0600, gone on logout). 'forget' clears it.
@@ -2999,6 +3145,7 @@ main() {
         --context) KUBE_CONTEXT="$2"; shift 2 ;;
         --kind)    KIND_CLUSTER="$2"; shift 2 ;;
         --profile) _profile_activate "$2"; shift 2 ;;
+        --no-profile) _profile_deactivate; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; break ;;
         -*) error_exit "Unknown global flag: $1" ;;
@@ -3007,8 +3154,13 @@ main() {
 
     [[ $# -gt 0 ]] || { usage; exit 2; }
 
-    local cmd="$1"; shift
-    case "$cmd" in
+    # Named subcmd, not cmd: 'cmd' is a local ARRAY in the _db_run helpers, and
+    # SC2178 reads that reuse across the file as one variable.
+    local subcmd="$1"; shift
+    # After the flags, before the command: 'set' may create a profile, every
+    # other command must find one.
+    _profile_require "$subcmd"
+    case "$subcmd" in
         install-deps)       cmd_install_deps "$@" ;;
         configure)          cmd_configure "$@" ;;
         start)              cmd_start "$@" ;;
@@ -3037,7 +3189,7 @@ main() {
         profiles)           cmd_profiles "$@" ;;
         forget)             cmd_forget "$@" ;;
         -h|--help|help)     usage ;;
-        *) error_exit "Unknown command: $cmd (run with --help for usage)" ;;
+        *) error_exit "Unknown command: $subcmd (run with --help for usage)" ;;
     esac
 }
 
