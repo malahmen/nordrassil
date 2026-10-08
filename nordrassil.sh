@@ -2930,14 +2930,31 @@ cmd_restore() {
 
     # Which databases this will overwrite, read out of the dump itself rather
     # than assumed, so the warning names what actually happens.
+    local named
+    # shellcheck disable=SC2086
+    named="$($reader "$file" 2>/dev/null \
+             | grep -oiE '^(CREATE DATABASE[^`]*`|USE `)[^`]+`' \
+             | grep -oE '`[^`]+`$' | tr -d '`' | sort -u | tr '\n' ' ')" || named=""
+
     local targets=""
     if [[ -n "$db" ]]; then
+        # --db names the connection's DEFAULT database. It does NOT confine
+        # the stream: every USE and CREATE DATABASE in the dump still applies,
+        # so '--db mangos' on a full dump wrote characters, realmd and logs
+        # as well while the warning named only mangos. Refused rather than
+        # explained, because the request cannot be honoured as meant — and
+        # this is the exact shape of the accident that put corelia's
+        # realmlist into meksha's realmd.
+        if [[ -n "${named// /}" ]]; then
+            warn "This dump names its own databases: ${named}"
+            warn "--db sets the default database for the connection; it does not confine the"
+            warn "dump. Every USE in the file still applies, so --db ${db} would overwrite"
+            warn "all of the above and report only ${db}."
+            error_exit "restore: refusing --db on a self-describing dump. Drop --db to restore it as it is, or dump just the part you want: dump --db ${db} --tables 'name ...'."
+        fi
         targets="$db (forced with --db)"
     else
-        # shellcheck disable=SC2086
-        targets="$($reader "$file" 2>/dev/null \
-                   | grep -oiE '^(CREATE DATABASE[^`]*`|USE `)[^`]+`' \
-                   | grep -oE '`[^`]+`$' | tr -d '`' | sort -u | tr '\n' ' ')" || targets=""
+        targets="$named"
     fi
     [[ -n "${targets// /}" ]] || error_exit "restore: the dump names no database — pass --db NAME to say where it goes."
 
