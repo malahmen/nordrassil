@@ -1,0 +1,37 @@
+name: ci
+
+# Every push and pull request. The suites need no network, no tokens and no
+# services: they work in temporary directories against file:// remotes and
+# stubbed clients, which is what makes them safe to run here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        # Printed because a suite that behaves differently on the runner than
+        # on a workstation is the thing hardest to debug from a log alone.
+        run: |
+          bash --version | head -1
+          git --version
+          shellcheck --version | sed -n 2p
+
+      - name: PyYAML, for the k8s Job half of test-custom-sql
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: shellcheck
+        run: |
+          shellcheck -S warning nordrassil.sh templates/entrypoint.sh tests/run-all.sh tests/test-custom-sql.sh tests/test-db-password.sh tests/test-dump.sh tests/test-profiles.sh tests/test-provisioning-guard.sh tests/test-restore-scope.sh 
+
+      - name: tests
+        run: tests/run-all.sh
