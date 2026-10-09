@@ -1,5 +1,7 @@
 # nordrassil
 
+[![ci](https://github.com/malahmen/nordrassil/actions/workflows/ci.yml/badge.svg)](https://github.com/malahmen/nordrassil/actions/workflows/ci.yml)
+
 > The World Tree. Roots in the database, a canopy your whole LAN can log into.
 
 A **gum-free, flag-driven** engine that builds and runs a
@@ -71,6 +73,7 @@ of Dockerfile / entrypoint / k8s manifests / source patches). No `gum`, no
 | `--context CTX` | use kube-context `CTX` |
 | `--kind CLUSTER` | use kind cluster `CLUSTER` (context `kind-CLUSTER`; side-loads the image) |
 | `--profile NAME` | use the profile `NAME` (see [Profiles](#profiles)); also `$NORDRASSIL_PROFILE` |
+| `--no-profile` | ignore `$NORDRASSIL_PROFILE` and act on the base config |
 
 Neither given ⇒ the current kube context.
 
@@ -269,6 +272,63 @@ in `$XDG_RUNTIME_DIR` — tmpfs, mode `0600`, gone on logout — so it is never
 written to a persistent file; with no `$XDG_RUNTIME_DIR` it simply prompts
 every time. `forget` clears it.
 
+**Verified, then cached.** The password is tried against the database before it
+is written to the cache, so a typo is rejected at the prompt instead of being
+remembered and failing every command after it. The check has three answers, not
+two: accepted (cache it), *refused by the database* (do not cache, and say so),
+and *could not tell* — an unreachable server — where the password is used for
+this run but not cached, because "the server did not answer" is not evidence
+the password is wrong.
+
+With no terminal to prompt on, it refuses with an explanation rather than
+dying: `[[ -r /dev/tty ]]` is a test of permission bits, not of whether the
+file can be opened, and it passes in a process that has no controlling
+terminal at all.
+
+`DB_PASS=ask` while *creating* a database is a different act — the answer
+becomes that database's password rather than being checked against it — so it
+warns and names the cache file it took the answer from.
+
+### Provisioning is local-only
+
+`MANAGED_EXTERNALLY` is a thing you declare. This one is inferred, and it
+catches the case where you forgot to.
+
+The nine commands that create or destroy a server — `configure`,
+`build-image`, `run-docker`, `stop-docker`, `run-k8s`, `stop-k8s`, `start`,
+`stop`, `edit` — all act on **this** machine: the local docker socket, the
+ambient kube context, conf files here, an image only this host can see. So if
+the active profile describes a server somewhere else, running one of them is
+not a remote deploy. It is a second, local server built from a remote server's
+settings, and `configure` in particular re-runs the world import.
+
+A profile "points elsewhere" when any of these holds:
+
+| Setting | Why it is remote |
+| --- | --- |
+| `SERVER_SSH_HOST` or `DB_SSH_HOST` set | the server or its database is reached over ssh |
+| `DB_TRANSPORT=tcp` to a host that is not this one | likewise |
+| `SERVER_TRANSPORT=kubectl` with **neither** `--context` nor `--kind` | the ambient context is whatever last touched `~/.kube/config` |
+
+The refusal names which of them tripped, and says what still works.
+`--context` and `--kind` are the deliberate exceptions: naming a cluster — a
+local `kind` one included — is the operator saying which, so `run-k8s` with
+either is allowed. Administration is never affected; it honours the transports
+and is meant to reach a remote server.
+
+The three commands that write to or read out a whole database — `apply-sql`,
+`dump` and `restore` — print the transport and the account first:
+
+```
+target:   meksha — podman container 'mariadb' on meksha (ssh), as root
+target:   <base config> — tcp 127.0.0.1:3306, as root
+```
+
+Not decoration. A mistyped `--profile` used to fall through to the base config
+and write to whatever *that* described, silently. The ssh hop is shown only
+where it is actually used: `tcp` connects straight to `DB_HOST`, so naming a
+host there would claim a hop that does not happen.
+
 ### Servers this tool does not own
 
 `MANAGED_EXTERNALLY=1` marks a profile as describing a server that something
@@ -356,7 +416,7 @@ NORDRASSIL=/path/to/nordrassil.sh tests/run-all.sh
 tests/test-profiles.sh                # one of them
 ```
 
-108 checks, no network and no server. `tests/stubs/` shadows `mariadb`,
+**130 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
 `mariadb-dump`, `docker` and `kubectl` on PATH, and every test works in its own
 `XDG_CONFIG_HOME` under a temporary directory — so a run cannot reach a
 database, a docker socket, a cluster, or the config in `~/.config/nordrassil`.
@@ -364,16 +424,26 @@ One assertion checks that last part directly.
 
 | File | What it covers |
 | ---- | -------------- |
-| `test-profiles.sh` | a profile that does not exist is refused; `--no-profile`; 0600 files in 0700 directories; `MANAGED_EXTERNALLY` cannot brick the tool |
-| `test-dump.sh` | `--default-character-set`, the 0600 dump file, the stream guard that rejects output something else wrote into, and the target banner |
-| `test-restore-scope.sh` | `--db` is refused on a dump that names its own databases |
-| `test-db-password.sh` | `DB_PASS=ask` resolves instead of reaching a conf file as the literal string; the three applied-states |
-| `test-custom-sql.sh` | only the selected Custom scripts are applied and only successful ones recorded, in the engine and in the k8s Job (that half needs PyYAML and skips without it) |
-| `test-provisioning-guard.sh` | provisioning refuses a profile pointing elsewhere, `--kind`/`--context` still work, administration is unaffected |
+| File | Checks | What it covers |
+| ---- | -----: | -------------- |
+| `test-profiles.sh` | 33 | a profile that does not exist is refused; `--no-profile`; 0600 files in 0700 directories; `MANAGED_EXTERNALLY` cannot brick the tool |
+| `test-db-password.sh` | 28 | `DB_PASS=ask` resolves instead of reaching a conf file as the literal string; verify-then-cache, and its three answers; the prompt survives having no terminal |
+| `test-provisioning-guard.sh` | 26 | provisioning refuses a profile pointing elsewhere, `--kind`/`--context` still work, administration is unaffected |
+| `test-dump.sh` | 19 | `--default-character-set`, the 0600 dump file, the stream guard that rejects output something else wrote into, and the target banner |
+| `test-custom-sql.sh` | 16 | only the selected Custom scripts are applied and only successful ones recorded, in the engine and in the k8s Job (that half needs PyYAML and skips without it) |
+| `test-restore-scope.sh` | 8 | `--db` is refused on a dump that names its own databases |
 
 Each file prints `pass=N fail=N` and exits non-zero if anything failed. The
 suite is checked against deliberate regressions rather than assumed to work: a
 test suite that cannot fail is the bug it is supposed to catch.
+
+### CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `shellcheck` and
+the whole suite on every push to `main`, every pull request, and on demand
+(`workflow_dispatch`). It needs no secrets and no services — that is the point
+of the stubs — and installs only PyYAML, for the half of `test-custom-sql.sh`
+that reads the k8s Job out of its manifest.
 
 ## Credits
 
