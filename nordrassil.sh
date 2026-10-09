@@ -663,7 +663,10 @@ _remote_run() {
 # take care to avoid.
 _remote_pw_run() {
     local host="$1" want_stdin="$2" pw="$3"; shift 3
-    local remote="IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec $(_shq_argv "$@")"
+    # Declared then assigned: in one statement the exit status would be
+    # local's, not _shq_argv's (SC2155), so a quoting failure would be invisible.
+    local remote
+    remote="IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec $(_shq_argv "$@")"
     if [[ -n "$want_stdin" ]]; then
         { printf '%s\n' "$pw"; cat; } | ssh -o BatchMode=yes "$host" "$remote"
     else
