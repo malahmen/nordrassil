@@ -22,6 +22,8 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; pass=$((pass+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
 chk()  { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 hdr()  { printf '\n\033[36m== %s\033[0m\n' "$1"; }
+# grab <fn...> — pull named functions out of the engine without running it.
+grab() { local f; for f in "$@"; do sed -n "/^${f}() {/,/^}/p" "$ENG"; done; }
 
 # Fresh config tree per case. XDG_RUNTIME_DIR too: the password cache lives
 # there and the real one must not be touched.
@@ -94,6 +96,30 @@ chk "  provisioning still refused while bad"   'printf "MANAGED_EXTERNALLY=\"yes
 newenv
 mkdir -p "$XDG_CONFIG_HOME/nordrassil"
 printf 'MANAGED_EXTERNALLY="yes"\n' > "$XDG_CONFIG_HOME/nordrassil/nordrassil.conf"
+
+# ---------------------------------------------------------------- N11
+hdr "N11 — a FIFO path with a space survives as one argument"
+# A recording docker: every argument on its own line, so a path that got
+# re-parsed by the shell inside the container shows up as two.
+mkdir -p "$T/rec"
+printf '#!/bin/sh\nfor a in "$@"; do printf "%%s\\n" "$a"; done > "$REC"\ncat >/dev/null\nexit 0\n' > "$T/rec/docker"
+chmod +x "$T/rec/docker"
+(
+    eval "$(grab _send_console_cmd)"
+    warn(){ :; }; info(){ :; }; error_exit(){ printf 'ERR %s\n' "$*"; exit 1; }
+    SERVER_SSH_HOST="" SERVER_CONTAINER_NAME=srv
+    SERVER_FIFO="/app/my fifo.stdin"
+    export REC="$T/rec.log" PATH="$T/rec:$PATH"
+    _send_console_cmd docker "server info" >/dev/null 2>&1
+) || true
+chk "the stub docker was actually invoked"   '[[ -s "$T/rec.log" ]]'
+chk "the FIFO arrives as a single argument"  'grep -qx "/app/my fifo.stdin" "$T/rec.log"'
+chk "  and is not split on the space"        '! grep -qx "/app/my" "$T/rec.log"'
+chk "  sh gets it as \$1, not inline"        'grep -qx '"'"'cat > "$1"'"'"' "$T/rec.log"'
+
+hdr "N11 — 'targets' is no longer an array and a string at once"
+chk "restore names its own local"            'grep -q "local overwrites=" "$ENG"'
+chk "the array uses remain untouched"        '[[ "$(grep -c "targets+=(" "$ENG")" -ge 3 ]]'
 
 printf '\n\033[36m== totals\033[0m\n  pass=%s fail=%s\n' "$pass" "$fail"
 printf '  tree: %s\n' "$T"

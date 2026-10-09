@@ -701,29 +701,110 @@ _kube() {
 # Prompting reads and writes /dev/tty, never stdin/stdout: callers run
 # queries inside $(...) and pipe SQL in, so a prompt on either would end up
 # captured as query output or eaten as SQL.
-_db_password() {
-    [[ "$DB_PASS" != "ask" ]] && { printf '%s' "$DB_PASS"; return 0; }
+# _db_pw_cache_dir — a tmpfs directory to keep the session password in, or
+# nothing.
+#
+# $XDG_RUNTIME_DIR first; /run/user/<uid> when it is unset but present, which
+# is the same directory under its usual name and covers a shell started
+# without a session environment. Nothing else is offered: /tmp is shared and
+# survives a logout, and a password is not worth putting there to save a
+# prompt.
+_db_pw_cache_dir() {
+    local base="${XDG_RUNTIME_DIR:-}"
+    [[ -n "$base" ]] || base="/run/user/$(id -u)"
+    [[ -d "$base" && -w "$base" ]] || return 1
+    install -d -m 0700 "${base}/nordrassil" 2>/dev/null || return 1
+    printf '%s' "${base}/nordrassil"
+}
 
-    local cache=""
-    if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
-        install -d -m 0700 "${XDG_RUNTIME_DIR}/nordrassil" 2>/dev/null || true
-        cache="${XDG_RUNTIME_DIR}/nordrassil/${PROFILE:-default}.dbpass"
-        [[ -f "$cache" ]] && { cat "$cache"; return 0; }
-    fi
+# _db_password_check <candidate> — 0 it authenticates, 1 it is refused,
+# 2 cannot tell.
+#
+# Three states for the same reason _db_is_applied has three: "no" and "do not
+# know" are different answers. A refused password must not be cached; an
+# unreachable database says nothing about the password and must not cause one
+# to be thrown away.
+#
+# _DB_PW_OVERRIDE breaks the recursion — _db_password is what _db_run calls to
+# get a password, so verifying by running a query would otherwise call back
+# into here. Exported for the command, so the subshells _db_run spawns see it.
+_db_password_check() {
+    local err
+    err="$(_DB_PW_OVERRIDE="$1" _db_query_raw "SELECT 1;" 2>&1 >/dev/null)" && return 0
+    case "$err" in
+        *"Access denied"*|*"access denied"*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
 
-    [[ -r /dev/tty && -w /dev/tty ]] || {
+# _db_prompt_password — read a password from the terminal.
+#
+# Split out from _db_password so the verify-then-cache policy around it can be
+# tested: a test can replace this and _db_password_check and then assert what
+# reaches the cache file, which is not possible while the prompt needs a tty.
+_db_prompt_password() {
+    # OPENED, not stat'ed. '[[ -r /dev/tty && -w /dev/tty ]]' tests the
+    # permission bits on the device node, which are fine even for a process
+    # with no controlling terminal — so under setsid, cron or a detached
+    # service the guard PASSED, each of the three redirections below then
+    # failed with a raw "/dev/tty: No such device or address" from bash, and
+    # the function finally reported "No password entered", which is not what
+    # happened. Measured, not assumed.
+    #
+    # The probe is a subshell so a failed redirection cannot take the caller
+    # with it, and so bash's own error message stays out of the output.
+    ( : <>/dev/tty ) 2>/dev/null || {
         warn "DB_PASS=ask needs a terminal to prompt on, and there is none."
         warn "  set DB_PASS explicitly for non-interactive use."
         return 1
     }
-    local pw
+    # Initialised: bash 5 sets it to the empty string when read hits EOF, but
+    # bash 3.2 — which macOS ships, and which this script supports — leaves it
+    # unset, so the test below died with 'pw: unbound variable' under set -u
+    # instead of saying no password was entered.
+    local pw=""
     printf 'Database password for %s: ' "${PROFILE:-default}" >/dev/tty
-    IFS= read -rs pw </dev/tty
+    IFS= read -rs pw </dev/tty || true
     printf '\n' >/dev/tty
     [[ -n "$pw" ]] || { warn "No password entered."; return 1; }
-    # umask in a subshell so the file cannot exist group/world-readable even
-    # momentarily between creation and a chmod.
-    [[ -n "$cache" ]] && ( umask 077; printf '%s' "$pw" >"$cache" )
+    printf '%s' "$pw"
+}
+
+_db_password() {
+    # Set only by _db_password_check, to break the recursion described there.
+    [[ -z "${_DB_PW_OVERRIDE:-}" ]] || { printf '%s' "$_DB_PW_OVERRIDE"; return 0; }
+    [[ "$DB_PASS" != "ask" ]] && { printf '%s' "$DB_PASS"; return 0; }
+
+    local cache="" dir
+    if dir="$(_db_pw_cache_dir)"; then
+        cache="${dir}/${PROFILE:-default}.dbpass"
+        [[ -f "$cache" ]] && { cat "$cache"; return 0; }
+    fi
+
+    local pw
+    pw="$(_db_prompt_password)" || return 1
+
+    # Verified BEFORE it is cached. A typo used to be written to the cache and
+    # then reused by every command for the rest of the session, each one
+    # failing with "Access denied" and none of them explaining why — the fix
+    # was to know to run 'forget'.
+    _db_password_check "$pw"
+    case $? in
+        0)  if [[ -n "$cache" ]]; then
+                # umask in a subshell so the file cannot exist group- or
+                # world-readable even momentarily.
+                ( umask 077; printf '%s' "$pw" >"$cache" )
+            else
+                warn "No tmpfs directory to cache the password in (XDG_RUNTIME_DIR unset and"
+                warn "  /run/user/$(id -u) unusable) — every command will prompt again."
+            fi
+            ;;
+        1)  warn "That password was refused by the database. Nothing was cached."
+            return 1
+            ;;
+        *)  warn "Could not verify the password (the database did not answer) — not caching it."
+            ;;
+    esac
     printf '%s' "$pw"
 }
 
@@ -1943,11 +2024,15 @@ _send_console_cmd() {
             ;;
         docker|podman)
             if [[ -z "$SERVER_SSH_HOST" ]]; then
-                printf '%s\n' "$line" | "$tgt" exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > ${SERVER_FIFO}" \
+                # The path is an ARGUMENT to sh, not spliced into its script:
+                # interpolated, a FIFO path containing a space or a shell
+                # metacharacter was re-parsed by the shell inside the
+                # container. 'sh' is the conventional $0 placeholder.
+                printf '%s\n' "$line" | "$tgt" exec -i "$SERVER_CONTAINER_NAME" sh -c 'cat > "$1"' sh "$SERVER_FIFO" \
                     || { warn "Failed to reach the container's console FIFO (${SERVER_FIFO})."; return 1; }
             else
                 printf '%s\n' "$line" | _remote_run "$SERVER_SSH_HOST" \
-                    "$tgt" exec -i "$SERVER_CONTAINER_NAME" sh -c "cat > ${SERVER_FIFO}" \
+                    "$tgt" exec -i "$SERVER_CONTAINER_NAME" sh -c 'cat > "$1"' sh "$SERVER_FIFO" \
                     || { warn "Failed to reach the container's console FIFO (${SERVER_FIFO}) on ${SERVER_SSH_HOST}."; return 1; }
             fi
             ;;
@@ -1955,7 +2040,7 @@ _send_console_cmd() {
             local pod
             pod="$(_kube_pick_pod "$SERVER_POD_SELECTOR" "$SERVER_SSH_HOST")" || return 1
             printf '%s\n' "$line" | _kube "$SERVER_SSH_HOST" \
-                exec -i -n "$K8S_NAMESPACE" ${SERVER_K8S_CONTAINER:+-c "$SERVER_K8S_CONTAINER"} "$pod" -- sh -c "cat > ${SERVER_FIFO}" \
+                exec -i -n "$K8S_NAMESPACE" ${SERVER_K8S_CONTAINER:+-c "$SERVER_K8S_CONTAINER"} "$pod" -- sh -c 'cat > "$1"' sh "$SERVER_FIFO" \
                 || { warn "Failed to reach the pod's console FIFO (${SERVER_FIFO})."; return 1; }
             ;;
     esac
@@ -3096,7 +3181,7 @@ cmd_restore() {
              | grep -oiE '^(CREATE DATABASE[^`]*`|USE `)[^`]+`' \
              | grep -oE '`[^`]+`$' | tr -d '`' | sort -u | tr '\n' ' ')" || named=""
 
-    local targets=""
+    local overwrites=""
     if [[ -n "$db" ]]; then
         # --db names the connection's DEFAULT database. It does NOT confine
         # the stream: every USE and CREATE DATABASE in the dump still applies,
@@ -3112,11 +3197,14 @@ cmd_restore() {
             warn "all of the above and report only ${db}."
             error_exit "restore: refusing --db on a self-describing dump. Drop --db to restore it as it is, or dump just the part you want: dump --db ${db} --tables 'name ...'."
         fi
-        targets="$db (forced with --db)"
+        overwrites="$db (forced with --db)"
     else
-        targets="$named"
+        overwrites="$named"
     fi
-    [[ -n "${targets// /}" ]] || error_exit "restore: the dump names no database — pass --db NAME to say where it goes."
+    # Named overwrites, not targets: 'targets' is a local ARRAY in cmd_dump
+    # and _db_run's helpers, and shellcheck reads the reuse across the file as
+    # one variable (SC2178).
+    [[ -n "${overwrites// /}" ]] || error_exit "restore: the dump names no database — pass --db NAME to say where it goes."
 
     # Resolved before the --yes gate, not after it, so the machine is named in
     # the same breath as the databases it would overwrite.
@@ -3126,9 +3214,9 @@ cmd_restore() {
     info "file:   ${file}"
     info "reader: ${reader}"
     _announce_db_target "$dbt"
-    warn "OVERWRITES: ${targets}"
+    warn "OVERWRITES: ${overwrites}"
 
-    [[ "$yes" -eq 1 ]] || error_exit "restore: refusing without --yes. This REPLACES the data in: ${targets} — on ${PROFILE:-<base config>} (${dbt})."
+    [[ "$yes" -eq 1 ]] || error_exit "restore: refusing without --yes. This REPLACES the data in: ${overwrites} — on ${PROFILE:-<base config>} (${dbt})."
 
     # A running mangosd caches world data and holds character state in
     # memory, so after a restore it disagrees with its own database until it
@@ -3142,7 +3230,7 @@ cmd_restore() {
     else
         $reader "$file" | _db_client_stdin || error_exit "restore: failed applying ${file}."
     fi
-    success "Restored ${file} into ${targets}"
+    success "Restored ${file} into ${overwrites}"
     info "Now: nordrassil.sh ${PROFILE:+--profile ${PROFILE} }restart"
 }
 
