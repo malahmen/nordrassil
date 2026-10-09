@@ -27,15 +27,23 @@ spec:
               value: "__WORLD_PORT__"
             - name: CLIENT_BUILD
               value: "__CLIENT_BUILD__"
+            # The Custom scripts the operator actually selected, comma- or
+            # space-separated basenames without .sql — the same CUSTOM_SQL
+            # 'configure' uses. Empty means apply none.
+            - name: CUSTOM_SQL
+              value: "__CUSTOM_SQL__"
           volumeMounts:
             - name: sql
               mountPath: /sql
               readOnly: true
           # Mirrors nordrassil.sh's _db_bootstrap: create schemas, import
           # Base + Anticheat + the full world dump + Migrations in filename
-          # order, then Custom content. Unlike 'configure', which applies
-          # only the scripts named in CUSTOM_SQL, this Job applies every
-          # sql/Custom/*.sql it finds (nothing renders a selection into it).
+          # order, then the Custom content named in CUSTOM_SQL — the same
+          # selection 'configure' honours. It used to apply every
+          # sql/Custom/*.sql it found, because nothing rendered the selection
+          # into it: a deploy therefore ran scripts the operator had
+          # deliberately left out (START_ON_GM_ISLAND, RESET_COOLDOWNS_ON_DUEL
+          # and AQ-SET_GATES_CLOSE among them on this deployment).
           #
           # Idempotent the same way 'configure' is, and through the same
           # table: every import is recorded as a row in
@@ -55,7 +63,26 @@ spec:
               # Same escaping as nordrassil.sh's _sql_escape: backslash
               # first, then the single quote.
               sql_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
-              applied() { [ -n "$(mysql_raw realmd -e "SELECT 1 FROM nordrassil_applied WHERE name='$(sql_escape "$1")' LIMIT 1;")" ]; }
+              # 0 applied, 1 not applied, 2 cannot tell. An empty result and
+              # a failed query are different answers: collapsing them made
+              # every import look pending whenever the query failed, and the
+              # next step then imported on top of live data.
+              applied() {
+                local out=""
+                out="$(mysql_raw realmd -e "SELECT 1 FROM nordrassil_applied WHERE name='$(sql_escape "$1")' LIMIT 1;")" || return 2
+                [ -n "$out" ]
+              }
+              # For the bootstrap imports, not knowing has to stop the Job:
+              # the alternative is writing over whatever is already there.
+              applied_or_die() {
+                local st=0
+                applied "$1" || st=$?
+                if [ "$st" -eq 2 ]; then
+                  echo "FATAL: could not read the import state of '$1' from realmd.nordrassil_applied — refusing to import on top of existing data." >&2
+                  exit 1
+                fi
+                return "$st"
+              }
               mark()    { mysql realmd -e "INSERT IGNORE INTO nordrassil_applied (name) VALUES ('$(sql_escape "$1")');"; }
               until mariadb-admin ping -h mariadb -uroot -p"${DB_PASS}" --silent; do
                 echo "Waiting for mariadb..."; sleep 2
@@ -79,13 +106,19 @@ spec:
                   [ -e "$f" ] || continue
                   mark "migration:$(basename "$f")"
                 done
+                # EVERY Custom file, deliberately, even though the apply
+                # loop below is now selective: this branch only runs when the
+                # tracking table was absent on an already-bootstrapped
+                # database, which means an older version of this Job did the
+                # importing — and that version applied all of them. Marking
+                # only the current selection would re-import the rest.
                 for f in /sql/Custom/*.sql; do
                   [ -e "$f" ] || continue
                   mark "custom:$(basename "$f")"
                 done
               fi
 
-              if applied base; then
+              if applied_or_die base; then
                 echo "Base schemas already imported — skipping."
               else
                 mysql realmd     < /sql/Base/logon.sql
@@ -97,13 +130,13 @@ spec:
               # Required, not optional: mangosd hard-crashes at startup if
               # these tables (e.g. realmd.antispam_blacklist) don't exist —
               # the Anticheat/Warden/antispam features are always compiled in.
-              if [ -d /sql/Anticheat ] && ! applied anticheat; then
+              if [ -d /sql/Anticheat ] && ! applied_or_die anticheat; then
                 mysql realmd     < /sql/Anticheat/realmd.sql
                 mysql mangos     < /sql/Anticheat/world.sql
                 mysql characters < /sql/Anticheat/characters.sql
                 mark anticheat
               fi
-              if applied world-full; then
+              if applied_or_die world-full; then
                 echo "World dump already imported — skipping."
               else
                 echo "Importing world dump (this takes a while)..."
@@ -118,7 +151,7 @@ spec:
               for f in /sql/Migrations/[0-9]*.sql; do
                 [ -e "$f" ] || continue
                 name="migration:$(basename "$f")"
-                if applied "$name"; then continue; fi
+                if applied_or_die "$name"; then continue; fi
                 case "$f" in
                   *_world.sql)      db=mangos ;;
                   *_characters.sql) db=characters ;;
@@ -130,12 +163,24 @@ spec:
                 mysql "$db" < "$f"
                 mark "$name"
               done
-              for f in /sql/Custom/*.sql; do
-                [ -e "$f" ] || continue
-                name="custom:$(basename "$f")"
-                if applied "$name"; then continue; fi
+              # Only the scripts named in CUSTOM_SQL, exactly as 'configure'
+              # does — including its "not found" warning, so a typo in the
+              # selection is visible rather than silently applying nothing.
+              for want in $(printf '%s' "${CUSTOM_SQL}" | tr ',' ' '); do
+                want="${want%.sql}"
+                [ -n "$want" ] || continue
+                f="/sql/Custom/${want}.sql"
+                if [ ! -f "$f" ]; then echo "  custom script not found, skipping: ${want}.sql"; continue; fi
+                name="custom:${want}.sql"
+                st=0; applied "$name" || st=$?
+                if [ "$st" -eq 0 ]; then continue; fi
+                if [ "$st" -eq 2 ]; then
+                  echo "  cannot tell whether ${want}.sql was applied — skipping it"; continue
+                fi
                 echo "Applying custom content: $f"
-                if mysql mangos < "$f"; then mark "$name"; else echo "  (failed, continuing) $f"; fi
+                # Marked only on success: a script recorded as applied after a
+                # failed import can never run again, including after a fix.
+                if mysql mangos < "$f"; then mark "$name"; else echo "  FAILED and NOT recorded: $f" >&2; fi
               done
               # None of the SQL dumps seed realmlist — it's inherently
               # deployment-specific (the realm's actual reachable

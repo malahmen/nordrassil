@@ -828,6 +828,25 @@ _refuse_if_managed() {
 # fails with a useful message before it starts prompting for arguments.
 _db_require() { _db_transport >/dev/null; }
 
+# _db_password_new — the password for a database this command is CREATING.
+#
+# Resolves exactly as _db_password does. The difference is what it says: with
+# DB_PASS=ask the only copy of the password is the session cache under
+# $XDG_RUNTIME_DIR, which is tmpfs and gone on logout. For a query that is the
+# point of 'ask' — prompt again next session. For the root password of a
+# database being brought into existence it is not, because afterwards nothing
+# on disk knows it. That has already happened once to this setup's 3.46
+# database.
+_db_password_new() {
+    local pw; pw="$(_db_password)" || return 1
+    if [[ "$DB_PASS" == "ask" ]]; then
+        warn "DB_PASS=ask, and this password is being SET on a database being created."
+        warn "  The only copy is ${XDG_RUNTIME_DIR:-<XDG_RUNTIME_DIR unset>}/nordrassil/${PROFILE:-default}.dbpass — tmpfs, gone on logout."
+        warn "  Keep it somewhere, or 'set DB_PASS <value>' so this profile records it."
+    fi
+    printf '%s' "$pw"
+}
+
 # _announce_db_target <resolved transport> — name the server about to be
 # written to, before writing to it.
 #
@@ -945,13 +964,21 @@ _db_import() {
 }
 
 _ensure_local_mariadb() {
+    # RESOLVED, not $DB_PASS. DB_PASS is a setting and may hold the sentinel
+    # 'ask', which the TUI offers first — and the literal string 'ask' was
+    # what became the container's root password, what the ping below
+    # authenticated with, and what went into the conf files and the k8s
+    # Secret. Nothing failed: the database was created with a three-character
+    # password, the conf files matched it, and the server started.
+    local pw; pw="$(_db_password_new)" || return 1
+
     if docker inspect --type container "$DB_CONTAINER_NAME" &>/dev/null; then
         docker start "$DB_CONTAINER_NAME" &>/dev/null || true
     else
         info "Starting local MariaDB container '${DB_CONTAINER_NAME}'..."
         # -e NAME (no '=value'): the password comes from this process's
         # environment instead of the docker CLI's argv — see _db_exec.
-        MARIADB_ROOT_PASSWORD="$DB_PASS" docker run -d \
+        MARIADB_ROOT_PASSWORD="$pw" docker run -d \
             --name "$DB_CONTAINER_NAME" \
             -e MARIADB_ROOT_PASSWORD \
             -p "127.0.0.1:${DB_PORT}:3306" \
@@ -963,7 +990,7 @@ _ensure_local_mariadb() {
 
     info "Waiting for MariaDB to accept connections..."
     local attempts=0
-    until MYSQL_PWD="$DB_PASS" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb-admin ping -u"$DB_USER" --silent &>/dev/null; do
+    until MYSQL_PWD="$pw" docker exec -e MYSQL_PWD "$DB_CONTAINER_NAME" mariadb-admin ping -u"$DB_USER" --silent &>/dev/null; do
         attempts=$((attempts + 1))
         [[ $attempts -ge 40 ]] && error_exit "Timed out waiting for MariaDB. Check: docker logs ${DB_CONTAINER_NAME}"
         sleep 1
@@ -999,10 +1026,33 @@ _db_table_exists() {
 }
 
 # _db_is_applied <name>
+# Returns 0 = applied, 1 = not applied, 2 = the question could not be
+# answered. The third state is the point of this function.
+#
+# It used to collapse a query ERROR into "not applied" (`|| out=""`), which is
+# the dangerous direction: an unreachable database, a failed login or a
+# missing table made every import look pending, so the next step re-imported
+# the world dump and re-ran every Custom script on top of live data. An empty
+# result and a failed query are different answers and callers need to tell
+# them apart — see _db_applied_or_die.
 _db_is_applied() {
-    local out
-    out="$(_db_query_raw "SELECT 1 FROM realmd.nordrassil_applied WHERE name='$(_sql_escape "$1")' LIMIT 1;" 2>/dev/null)" || out=""
+    local out rc=0
+    out="$(_db_query_raw "SELECT 1 FROM realmd.nordrassil_applied WHERE name='$(_sql_escape "$1")' LIMIT 1;" 2>/dev/null)" || rc=$?
+    [[ $rc -eq 0 ]] || return 2
     [[ -n "$out" ]]
+}
+
+# _db_applied_or_die <name> — _db_is_applied, with "cannot tell" fatal.
+#
+# For every import in _db_bootstrap the alternative to knowing is writing on
+# top of whatever is already there, so not knowing has to stop the run. The
+# bookkeeping table is created (with its own error_exit) before the first of
+# these calls, so a failure here is a real one and not a fresh database.
+_db_applied_or_die() {
+    local st=0
+    _db_is_applied "$1" || st=$?
+    [[ $st -ne 2 ]] || error_exit "Could not read the import state of '${1}' from realmd.nordrassil_applied. Refusing to continue — the next step would import on top of whatever is already in the database."
+    return $st
 }
 
 # _db_mark_applied <name> — INSERT IGNORE so a re-run after a partial failure
@@ -1070,7 +1120,7 @@ _db_bootstrap() {
         || error_exit "Failed to create realmd.nordrassil_applied (the import bookkeeping table)."
     [[ $had_tracking -eq 1 ]] || _db_seed_applied_from_markers
 
-    if ! _db_is_applied base; then
+    if ! _db_applied_or_die base; then
         info "Importing base schemas (sql/Base/*.sql)..."
         info "Importing sql/Base/logon.sql -> realmd..."
         # Was an inline 'bash -c' that redefined _db_import with the password
@@ -1092,7 +1142,7 @@ _db_bootstrap() {
     # features are always compiled in and mangosd hard-crashes at startup
     # (uncaught C++ exception) if e.g. realmd.antispam_blacklist doesn't
     # exist. Same per-database file naming as Base/.
-    if [[ -d "${sql_dir}/Anticheat" ]] && ! _db_is_applied anticheat; then
+    if [[ -d "${sql_dir}/Anticheat" ]] && ! _db_applied_or_die anticheat; then
         info "Importing anticheat schemas (sql/Anticheat/*.sql) — required, not optional..."
         _db_import realmd     "${sql_dir}/Anticheat/realmd.sql"
         _db_import mangos     "${sql_dir}/Anticheat/world.sql"
@@ -1103,7 +1153,7 @@ _db_bootstrap() {
         info "Anticheat schemas already imported (recorded in the database) — skipping."
     fi
 
-    if ! _db_is_applied world-full; then
+    if ! _db_applied_or_die world-full; then
         local dump="${sql_dir}/world_full_14_june_2021.sql"
         [[ -f "$dump" ]] || error_exit "World dump not found: ${dump}"
         warn "Importing the full world dump (~250MB) — this can take several minutes."
@@ -1131,7 +1181,7 @@ _db_bootstrap() {
     while IFS= read -r mfile; do
         [[ -z "$mfile" ]] && continue
         mname="$(basename "$mfile")"
-        if _db_is_applied "migration:${mname}"; then
+        if _db_applied_or_die "migration:${mname}"; then
             skipped=$((skipped + 1))
             continue
         fi
@@ -1167,18 +1217,38 @@ _db_bootstrap() {
     # the available list (see 'list-custom') and sets this. Anything not listed is
     # skipped; files already applied (recorded in the DB) are never re-applied.
     if [[ -d "${sql_dir}/Custom" && -n "${CUSTOM_SQL:-}" ]]; then
-        local want cfile applied_custom=0
+        local want cfile st applied_custom=0 failed_custom=0
         local wanted="${CUSTOM_SQL//,/ }"
         for want in $wanted; do
             want="${want%.sql}"
             cfile="${sql_dir}/Custom/${want}.sql"
             [[ -f "$cfile" ]] || { warn "Custom script not found, skipping: ${want}.sql"; continue; }
-            _db_is_applied "custom:${want}.sql" && { info "Custom already applied: ${want}.sql"; continue; }
-            _db_import mangos "$cfile" || warn "Custom script failed (continuing): ${want}.sql"
-            _db_mark_applied "custom:${want}.sql"
-            info "Applied: ${want}.sql"; applied_custom=$((applied_custom + 1))
+            st=0; _db_is_applied "custom:${want}.sql" || st=$?
+            if [[ $st -eq 0 ]]; then
+                info "Custom already applied: ${want}.sql"; continue
+            elif [[ $st -eq 2 ]]; then
+                # Not fatal here, unlike the bootstrap imports: one Custom
+                # script is skippable, and the rest of configure is still
+                # worth finishing. Skipped rather than applied, because
+                # applying it twice is the unrecoverable direction.
+                warn "Cannot tell whether ${want}.sql was already applied (the tracking query failed) — skipping it."
+                failed_custom=$((failed_custom + 1)); continue
+            fi
+            if _db_import mangos "$cfile"; then
+                _db_mark_applied "custom:${want}.sql"
+                info "Applied: ${want}.sql"; applied_custom=$((applied_custom + 1))
+            else
+                # NOT marked. It used to be marked regardless of the import's
+                # exit status, so a script that failed halfway was recorded as
+                # done and could never run again — including after it was
+                # fixed, which is exactly when it needs to.
+                warn "Custom script FAILED and was NOT recorded as applied: ${want}.sql"
+                warn "  Fix it and re-run 'configure'; a partial import may need undoing by hand."
+                failed_custom=$((failed_custom + 1))
+            fi
         done
         [[ $applied_custom -gt 0 ]] && success "Custom content applied (${applied_custom})."
+        [[ $failed_custom -gt 0 ]] && warn "Custom scripts not applied: ${failed_custom} (see above)."
     fi
 
     _ensure_realmlist
@@ -1216,7 +1286,9 @@ _render_mangosd_conf() {
     # _sed_escape — a DB password or path containing '&', '|' or '\' would
     # otherwise corrupt the line (or, with '|', break the sed command).
     data_dir="$(_sed_escape "$data_dir")"; logs_dir="$(_sed_escape "$logs_dir")"; warden_dir="$(_sed_escape "$warden_dir")"
-    local db_conn; db_conn="$(_sed_escape "${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS}")"
+    # Resolved, not $DB_PASS — see _ensure_local_mariadb.
+    local pw; pw="$(_db_password)" || return 1
+    local db_conn; db_conn="$(_sed_escape "${DB_HOST};${DB_PORT};${DB_USER};${pw}")"
     cp "$src" "$dst"
     # The repack's conf files ship with Windows CRLF line endings (they were
     # distributed alongside .exe binaries). Left as-is, sed's substitutions
@@ -1264,7 +1336,9 @@ _render_realmd_conf() {
     local src="$1" dst="$2" logs_dir="$3"
     # sed-replacement escaping — see _render_mangosd_conf.
     logs_dir="$(_sed_escape "$logs_dir")"
-    local db_conn; db_conn="$(_sed_escape "${DB_HOST};${DB_PORT};${DB_USER};${DB_PASS}")"
+    # Resolved, not $DB_PASS — see _ensure_local_mariadb.
+    local pw; pw="$(_db_password)" || return 1
+    local db_conn; db_conn="$(_sed_escape "${DB_HOST};${DB_PORT};${DB_USER};${pw}")"
     cp "$src" "$dst"
     # See the matching comment in _render_mangosd_conf — same CRLF-source,
     # mixed-line-ending issue applies here too.
@@ -2398,7 +2472,9 @@ cmd_run_k8s() {
     # and db-init-job.yaml below) — right after the namespace so it exists
     # before anything that mounts it. base64 output is [A-Za-z0-9+/=] only,
     # so it needs no YAML quoting and is safe for render_template's sed.
-    local db_pass_b64; db_pass_b64="$(printf '%s' "$DB_PASS" | base64 | tr -d '\n')"
+    # Resolved, not $DB_PASS: the Secret used to carry base64("ask").
+    local db_pass_new; db_pass_new="$(_db_password_new)" || return 1
+    local db_pass_b64; db_pass_b64="$(printf '%s' "$db_pass_new" | base64 | tr -d '\n')"
     echo "---" >> "$manifest"
     render_template "${k8s_tpl}/db-secret.yaml" "NAMESPACE=${K8S_NAMESPACE}" "DB_PASS_B64=${db_pass_b64}" >> "$manifest"
 
@@ -2457,6 +2533,7 @@ cmd_run_k8s() {
         "NAMESPACE=${K8S_NAMESPACE}" \
         "REALM_ID=${REALM_ID}" "REALM_NAME=$(_yaml_escape "$REALM_NAME")" "REALM_ADDRESS=$(_yaml_escape "$REALM_ADDRESS")" \
         "WORLD_PORT=${WORLD_PORT}" "CLIENT_BUILD=${CLIENT_BUILD}" \
+        "CUSTOM_SQL=$(_yaml_escape "${CUSTOM_SQL:-}")" \
         "SQL_HOSTPATH=${SOURCE_DIR}/sql" > "$job_manifest"
     # shellcheck disable=SC2086
     kubectl $ctx_flags apply -f "$job_manifest" || error_exit "db-init Job apply failed."
@@ -2625,7 +2702,7 @@ cmd_apply_sql() {
     dbt="$(_db_transport)" || return 1
     _announce_db_target "$dbt"
 
-    local sum name
+    local sum name st
     sum="$(sha256sum "$file" | cut -c1-12)"
     name="sql:$(basename "$file")@${sum}"
 
@@ -2645,7 +2722,9 @@ cmd_apply_sql() {
         # apply-sql is exactly the command such a server needs.
         _db_exec "CREATE TABLE IF NOT EXISTS realmd.nordrassil_applied (name VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);" >/dev/null \
             || error_exit "apply-sql: could not create the tracking table realmd.nordrassil_applied."
-        if _db_is_applied "$name"; then
+        st=0; _db_is_applied "$name" || st=$?
+        [[ $st -ne 2 ]] || error_exit "apply-sql: could not read the import state of '${name}' from realmd.nordrassil_applied — refusing to apply blind (--no-record skips the check)."
+        if [[ $st -eq 0 ]]; then
             if [[ "$force" -eq 0 ]]; then
                 success "Already applied, identical content — nothing to do (--force applies it again)."
                 return 0
