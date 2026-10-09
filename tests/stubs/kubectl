@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "TEST GUARD: kubectl must not be called" >&2
+exit 97
