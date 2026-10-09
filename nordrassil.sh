@@ -816,6 +816,76 @@ _db_transport() {
 # did not bootstrap (no marker directory, realmd.account already present)
 # _db_seed_applied_from_markers warns and lets every import run again, over
 # live data.
+# _is_local_db_host — whether DB_HOST names this machine.
+_is_local_db_host() {
+    case "${DB_HOST:-}" in
+        ""|localhost|localhost.localdomain|127.*|::1|"[::1]") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# _refuse_if_remote <command> — the guard for provisioning a target this
+# machine does not own.
+#
+# The transports say WHERE the database and the server are. Provisioning never
+# consulted them: 'run-docker' drives the LOCAL docker socket, 'run-k8s' and
+# 'stop-k8s' drive whatever kube context happens to be current, 'configure'
+# writes conf files on THIS host, and 'build-image' builds an image only this
+# host can see. Point a profile at another machine and every one of them still
+# acts here — on the machine this was reviewed on the ambient context was an
+# AWS EKS cluster, so 'run-k8s' with a homelab profile would have deployed to
+# it.
+#
+# Refusing rather than routing. Routing means teaching six commands to run
+# kubectl and docker over ssh, which is the file split's job; refusing costs a
+# few lines and closes the hole now. The commands that ADMINISTER a remote
+# server — accounts, characters, search, apply-sql, dump, restore, restart,
+# status — already honour the transports and are untouched.
+_refuse_if_remote() {
+    local cmd="$1" why=""
+    [[ -z "${SERVER_SSH_HOST:-}" ]] || why="SERVER_SSH_HOST=${SERVER_SSH_HOST}"
+    [[ -z "${DB_SSH_HOST:-}" ]]     || why="${why:+${why}, }DB_SSH_HOST=${DB_SSH_HOST}"
+    # kubectl is only suspect when no cluster was named: with --kind or
+    # --context the operator has said which one, and a local kind cluster is a
+    # workflow run-k8s supports on purpose. Without either it is the ambient
+    # context, which is whatever the last tool to touch ~/.kube/config left
+    # behind.
+    if [[ "${SERVER_TRANSPORT:-}" == "kubectl" && -z "$KUBE_CONTEXT" && -z "$KIND_CLUSTER" ]]; then
+        why="${why:+${why}, }SERVER_TRANSPORT=kubectl with no --context/--kind"
+    fi
+    if [[ "${DB_TRANSPORT:-}" == "tcp" ]] && ! _is_local_db_host; then
+        why="${why:+${why}, }DB_TRANSPORT=tcp to ${DB_HOST}"
+    fi
+    [[ -n "$why" ]] || return 0
+
+    warn "'${cmd}' provisions a server on THIS machine: the local docker socket, the"
+    warn "ambient kube context, conf files here, an image only this host can see."
+    warn "This profile${PROFILE:+ (${PROFILE})} describes a server somewhere else — ${why}."
+    warn "Administration still works and honours the transports: accounts, characters,"
+    warn "search, apply-sql, dump, restore, restart, status."
+    error_exit "Refusing to run '${cmd}' locally for a profile that points elsewhere."
+}
+
+# _announce_kube_target — say which cluster is about to be changed.
+#
+# _refuse_if_remote covers the case where the profile says the server is
+# elsewhere. This covers the one where nothing says anything: with no
+# --context/--kind, kubectl uses the ambient context, which is whatever the
+# last tool to touch ~/.kube/config left behind. Printing it is the difference
+# between "deployed" and "deployed to the cluster you meant".
+_announce_kube_target() {
+    local ctx
+    if [[ -n "$KIND_CLUSTER" ]]; then
+        ctx="kind-${KIND_CLUSTER} (--kind)"
+    elif [[ -n "$KUBE_CONTEXT" ]]; then
+        ctx="${KUBE_CONTEXT} (--context)"
+    else
+        ctx="$(kubectl config current-context 2>/dev/null || true)"
+        ctx="${ctx:-<none set>} (ambient — no --context/--kind given)"
+    fi
+    warn "kube context: ${ctx}   namespace: ${K8S_NAMESPACE}"
+}
+
 _refuse_if_managed() {
     [[ "$MANAGED_EXTERNALLY" == "1" ]] || return 0
     warn "'${1}' provisions or re-bootstraps a server, and this profile${PROFILE:+ (${PROFILE})} is marked"
@@ -1391,6 +1461,7 @@ cmd_configure() {
     header "nordrassil — Configure"
     _settings
     _refuse_if_managed configure
+    _refuse_if_remote configure
     while [[ $# -gt 0 ]]; do case "$1" in
         --custom) CUSTOM_SQL="$2"; shift 2 ;;
         *) error_exit "configure: unknown flag: $1" ;;
@@ -1546,6 +1617,7 @@ cmd_start() {
     header "nordrassil — Start (local)"
     _settings
     _refuse_if_managed start
+    _refuse_if_remote start
 
     [[ -f "${ETC_DIR}/mangosd.conf" ]] || error_exit "Not configured yet — run 'configure' first."
     _ensure_local_mariadb
@@ -1604,6 +1676,7 @@ cmd_stop() {
     header "nordrassil — Stop (local)"
     _settings
     _refuse_if_managed stop
+    _refuse_if_remote stop
 
     local realmd_pf="${PF_DIR}/realmd.pid" mangosd_pf="${PF_DIR}/mangosd.pid"
 
@@ -2193,6 +2266,7 @@ cmd_edit() {
     header "nordrassil — Edit conf files"
     _settings
     _refuse_if_managed edit
+    _refuse_if_remote edit
 
     local file=""
     while [[ $# -gt 0 ]]; do case "$1" in
@@ -2225,6 +2299,7 @@ cmd_build_image() {
     header "nordrassil — Build Docker image"
     _settings
     _refuse_if_managed build-image
+    _refuse_if_remote build-image
     _check_docker
 
     [[ -d "$SOURCE_DIR" ]] || error_exit "SOURCE_DIR not set or missing — run 'configure' first."
@@ -2271,6 +2346,7 @@ cmd_run_docker() {
     header "nordrassil — Run (Docker, LAN)"
     _settings
     _refuse_if_managed run-docker
+    _refuse_if_remote run-docker
     _check_docker
 
     local force=0
@@ -2332,6 +2408,7 @@ cmd_stop_docker() {
     header "nordrassil — Stop (Docker)"
     _settings
     _refuse_if_managed stop-docker
+    _refuse_if_remote stop-docker
 
     docker inspect --type container "$SERVER_CONTAINER_NAME" &>/dev/null \
         || { info "Container '${SERVER_CONTAINER_NAME}' not found — nothing to stop."; return; }
@@ -2393,6 +2470,8 @@ cmd_run_k8s() {
     header "nordrassil — Run (Kubernetes, LAN via hostNetwork)"
     _settings
     _refuse_if_managed run-k8s
+    _refuse_if_remote run-k8s
+    _announce_kube_target
 
     # Storage backend, namespace and realm address come from config (set them
     # with 'set K8S_STORAGE_TYPE hostpath|storageclass', 'set K8S_DATA_HOSTPATH',
@@ -2568,6 +2647,8 @@ cmd_stop_k8s() {
     header "nordrassil — Stop (Kubernetes)"
     _settings
     _refuse_if_managed stop-k8s
+    _refuse_if_remote stop-k8s
+    _announce_kube_target
 
     command -v kubectl &>/dev/null || error_exit "kubectl not found."
 
@@ -3204,6 +3285,14 @@ Profiles (one per server):
 
   DB_PASS=ask prompts once per session per profile, cached in
   $XDG_RUNTIME_DIR (tmpfs, 0600, gone on logout). 'forget' clears it.
+
+  Provisioning acts on THIS machine — the local docker socket, the ambient
+  kube context, conf files here — so configure, build-image, run-docker,
+  stop-docker, run-k8s, stop-k8s, start, stop and edit are REFUSED when the
+  profile points elsewhere (*_SSH_HOST set, SERVER_TRANSPORT=kubectl with no
+  --context/--kind, or DB_TRANSPORT=tcp to a non-local host). Administration
+  honours the transports and is unaffected. run-k8s and stop-k8s print the
+  kube context they are about to change.
 
   set MANAGED_EXTERNALLY 1     this server is provisioned by something else
                                (Ansible, GitOps, CI). configure, build-image,
