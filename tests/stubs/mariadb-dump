@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_ARGV_LOG:-/dev/null}"
+case "${STUB_DUMP_MODE:-good}" in
+  chatty) printf 'Welcome to meksha. 3 packages can be updated.\n' ;;
+  empty)  exit 0 ;;
+esac
+cat <<'SQL'
+-- MariaDB dump 10.19  Distrib 10.11.6-MariaDB, for debian-linux-gnu
+--
+CREATE TABLE `account` (`id` int(11) NOT NULL);
+INSERT INTO `account` VALUES (1);
+SQL

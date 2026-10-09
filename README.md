@@ -348,6 +348,33 @@ fall back to sane defaults for anything unset.
 | `SERVER_K8S_CONTAINER` | (empty) | container in that pod; empty lets kubectl choose (and print "Defaulted container…") |
 | `SERVER_FIFO` | `/app/mangosd.stdin` | mangosd's console FIFO **inside** the container |
 
+## Testing
+
+```sh
+tests/run-all.sh                      # every test file
+NORDRASSIL=/path/to/nordrassil.sh tests/run-all.sh
+tests/test-profiles.sh                # one of them
+```
+
+108 checks, no network and no server. `tests/stubs/` shadows `mariadb`,
+`mariadb-dump`, `docker` and `kubectl` on PATH, and every test works in its own
+`XDG_CONFIG_HOME` under a temporary directory — so a run cannot reach a
+database, a docker socket, a cluster, or the config in `~/.config/nordrassil`.
+One assertion checks that last part directly.
+
+| File | What it covers |
+| ---- | -------------- |
+| `test-profiles.sh` | a profile that does not exist is refused; `--no-profile`; 0600 files in 0700 directories; `MANAGED_EXTERNALLY` cannot brick the tool |
+| `test-dump.sh` | `--default-character-set`, the 0600 dump file, the stream guard that rejects output something else wrote into, and the target banner |
+| `test-restore-scope.sh` | `--db` is refused on a dump that names its own databases |
+| `test-db-password.sh` | `DB_PASS=ask` resolves instead of reaching a conf file as the literal string; the three applied-states |
+| `test-custom-sql.sh` | only the selected Custom scripts are applied and only successful ones recorded, in the engine and in the k8s Job (that half needs PyYAML and skips without it) |
+| `test-provisioning-guard.sh` | provisioning refuses a profile pointing elsewhere, `--kind`/`--context` still work, administration is unaffected |
+
+Each file prints `pass=N fail=N` and exits non-zero if anything failed. The
+suite is checked against deliberate regressions rather than assumed to work: a
+test suite that cannot fail is the bug it is supposed to catch.
+
 ## Credits
 
 The server itself is [VMaNGOS](https://github.com/vmangos/core) and the vanilla

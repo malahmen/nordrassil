@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stub client. Answers the only queries these paths make, then swallows stdin.
+q=""; for a in "$@"; do [[ "$prev" == "-e" ]] && q="$a"; prev="$a"; done
+case "$q" in
+  *"SHOW DATABASES LIKE"*) sed -n "s/.*LIKE '\([^']*\)'.*/\1/p" <<<"$q" ;;
+  *"SHOW TABLES FROM"*)    sed -n "s/.*LIKE '\([^']*\)'.*/\1/p" <<<"$q" ;;
+esac
+cat >/dev/null 2>&1 || true
+exit 0
