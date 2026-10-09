@@ -454,4 +454,4 @@ administers; the emulator is theirs.
 
 ## License
 
-[The Unlicense](LICENSE) — public domain.
+[MIT](LICENSE) © 2026 malahmen.
