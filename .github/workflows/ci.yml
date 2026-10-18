@@ -31,7 +31,7 @@ jobs:
 
       - name: shellcheck
         run: |
-          shellcheck -S warning nordrassil.sh templates/entrypoint.sh tests/run-all.sh tests/test-custom-sql.sh tests/test-db-password.sh tests/test-dump.sh tests/test-profiles.sh tests/test-provisioning-guard.sh tests/test-restore-scope.sh 
+          shellcheck -S warning nordrassil.sh templates/entrypoint.sh tests/run-all.sh tests/test-custom-sql.sh tests/test-db-password.sh tests/test-dump.sh tests/test-profiles.sh tests/test-provisioning-guard.sh tests/test-restore-scope.sh tests/test-settings-entrypoint-ace.sh
 
       - name: tests
         run: tests/run-all.sh

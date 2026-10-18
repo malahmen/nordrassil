@@ -59,7 +59,10 @@ _shutdown() {
 trap '_shutdown 0' TERM INT
 
 # Exit as soon as either process dies — 'wait -n' returns that child's status.
-wait -n "$realmd_pid" "$mangosd_pid"
-status=$?
+# '|| status=$?', not a bare wait: a non-zero status under set -e ended the
+# script right here, so the survivor was never told to stop and went down
+# with the container's SIGKILL instead - mangosd without saving.
+status=0
+wait -n "$realmd_pid" "$mangosd_pid" || status=$?
 echo "A server process exited (status ${status}) — shutting down the other."
 _shutdown "$status"
