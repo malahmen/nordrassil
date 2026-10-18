@@ -10,6 +10,9 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENG="${NORDRASSIL:-${TEST_DIR}/../nordrassil.sh}"
 [ -f "$ENG" ] || { echo "nordrassil.sh not found at $ENG" >&2; exit 1; }
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# The engine is nordrassil.sh and the lib/ files it sources: functions and
+# source checks are read from all of them, in one file.
+SRC="$T/engine-src.sh"; cat "$ENG" "$(dirname "$ENG")"/lib/*.sh > "$SRC" 2>/dev/null
 # Stubs shadow the real clients and orchestrators: no test here may reach a
 # database, a docker socket or a cluster.
 export PATH="${TEST_DIR}/stubs:$PATH"
@@ -78,5 +81,16 @@ outb="$(runb run-docker)"
 # host) it would have proceeded instead of reporting the daemon unreachable.
 chk "an unrefused run hits the stub docker"  'grep -q "docker daemon not reachable" <<<"$outb"'
 chk "  so no real docker was reachable"      '! grep -qi "docker run\|container started" <<<"$outb"'
+
+hdr "one gate"
+# Every provisioning command goes through _require_owned_target, and nothing
+# calls the two guards it is made of on its own: a command that called one
+# of them would pass a target the other refuses.
+for c in configure edit start stop build_image run_docker stop_docker run_k8s stop_k8s; do
+    body="$(sed -n "/^cmd_${c}() {/,/^}/p" "$SRC")"
+    chk "cmd_${c} goes through the gate"     'grep -q "_require_owned_target " <<<"$body"'
+done
+direct="$(grep -nE '^[[:space:]]+_refuse_if_(managed|remote) ' "$SRC" | grep -vF '"$1"')"
+chk "no command calls a guard directly"  '[[ -z "$direct" ]]'
 
 printf '\n  pass=%s fail=%s\n' "$pass" "$fail"; [[ $fail -eq 0 ]]

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Kamino items 46, 47 and 49. Each guard is checked both ways (it fires, and
 # a good value still passes), and the entrypoint and the ACE download are also
-# run as they were on main, to show the bug was real.
+# run as they were before the fix, to show the bug was real.
 # shellcheck disable=SC2034
 # `out`/`rc` and the ACE globals are read by the single-quoted assertions chk
 # evaluates, and by engine functions pulled in with eval.
@@ -11,6 +11,9 @@ ENG="${NORDRASSIL:-${TEST_DIR}/../nordrassil.sh}"
 ENTRY="${TEST_DIR}/../templates/entrypoint.sh"
 [ -f "$ENG" ] || { echo "nordrassil.sh not found at $ENG" >&2; exit 1; }
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# The engine is nordrassil.sh and the lib/ files it sources: functions and
+# source checks are read from all of them, in one file.
+SRC="$T/engine-src.sh"; cat "$ENG" "$(dirname "$ENG")"/lib/*.sh > "$SRC" 2>/dev/null
 export PATH="${TEST_DIR}/stubs:$PATH"
 export XDG_CONFIG_HOME="$T/config" XDG_RUNTIME_DIR="$T/run"
 mkdir -p "$T/config" "$T/run"
@@ -23,9 +26,11 @@ hdr()  { printf '\n\033[36m== %s\033[0m\n' "$1"; }
 # grab <file> <fn...> — pull named functions out of a script without running it.
 grab() { local file="$1" f; shift; for f in "$@"; do sed -n "/^${f}() {/,/^}/p" "$file"; done; }
 run()  { bash "$ENG" "$@" 2>&1; }
-# The version on main, for the "was it broken before?" runs. Skipped when
-# there is no main to read (a tarball, a shallow CI clone without it).
-old() { git -C "$TEST_DIR/.." show "main:$1" 2>/dev/null; }
+# The version before the fix (fd422c6, main before #23), for the "was it
+# broken before?" runs. Skipped when that commit is not there to read (a
+# tarball, a shallow clone).
+BEFORE=fd422c6
+old() { git -C "$TEST_DIR/.." show "${BEFORE}:$1" 2>/dev/null; }
 
 # ---------------------------------------------------------------- item 47
 hdr "item 47 — numeric settings are checked on the way in"
@@ -98,12 +103,12 @@ entry_run "$ENTRY" 0 term
 chk "SIGTERM stops both, exit 0"               '[[ $rc -eq 0 && -f "$D/mangosd.term" ]]'
 if old templates/entrypoint.sh > "$T/entry-old.sh"; then
     entry_run "$T/entry-old.sh" 3
-    chk "on main: _shutdown was skipped"       '[[ $rc -eq 3 ]] && ! grep -q "Shutting down" "$D/log" && [[ ! -f "$D/mangosd.term" ]]'
+    chk "before the fix: _shutdown was skipped"       '[[ $rc -eq 3 ]] && ! grep -q "Shutting down" "$D/log" && [[ ! -f "$D/mangosd.term" ]]'
 fi
 
 # ---------------------------------------------------------------- item 49
 hdr "item 49 — the ACE tarball is checked before it is unpacked"
-chk "the pinned digest is 8.0.7's"             'grep -q "^ACE_BUILD_SHA256=\"017fa5c7499e3c8f98921f86e007cda7c41c14a926447abbe5a7c5e7960480c7\"" "$ENG"'
+chk "the pinned digest is 8.0.7's"             'grep -q "^ACE_BUILD_SHA256=\"017fa5c7499e3c8f98921f86e007cda7c41c14a926447abbe5a7c5e7960480c7\"" "$SRC"'
 # A tarball shaped like ACE's, curl that hands it over, make that "builds".
 mkdir -p "$T/src/ACE_wrappers/ace" "$T/src/ACE_wrappers/include/makeinclude" "$T/bin"
 : > "$T/src/ACE_wrappers/ace/ACE.h"
@@ -130,16 +135,16 @@ ace_run() {   # ace_run <engine file> <sha to pin> -> sets rc, out
         _build_ace_from_source 2>&1
     )"; rc=$?
 }
-ace_run "$ENG" "$(printf '0%.0s' {1..64})"
+ace_run "$SRC" "$(printf '0%.0s' {1..64})"
 chk "a mismatch is refused"                    '[[ $rc -ne 0 ]] && grep -q "does not match its pinned sha256" <<<"$out"'
 chk "  nothing was unpacked"                   '[[ ! -e "$T/cache/ace-wrappers/8.0.7/ACE_wrappers" ]]'
 chk "  nothing was built"                      '[[ ! -f "$T/make.ran" ]]'
 chk "  the download was removed"               '[[ ! -f "$T/cache/ace-wrappers/8.0.7/ACE-8.0.7.tar.gz" ]]'
-ace_run "$ENG" "$GOOD_SHA"
+ace_run "$SRC" "$GOOD_SHA"
 chk "a match builds (control)"                 '[[ $rc -eq 0 && -f "$T/cache/ace-wrappers/8.0.7/ACE_wrappers/lib/libACE.so" ]]'
 if old nordrassil.sh > "$T/eng-old.sh"; then
     ace_run "$T/eng-old.sh" "$(printf '0%.0s' {1..64})"
-    chk "on main: any tarball was built"       '[[ $rc -eq 0 && -f "$T/make.ran" ]]'
+    chk "before the fix: any tarball was built"       '[[ $rc -eq 0 && -f "$T/make.ran" ]]'
 fi
 
 echo

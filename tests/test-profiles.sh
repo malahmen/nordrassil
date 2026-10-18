@@ -11,6 +11,9 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENG="${NORDRASSIL:-${TEST_DIR}/../nordrassil.sh}"
 [ -f "$ENG" ] || { echo "nordrassil.sh not found at $ENG" >&2; exit 1; }
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# The engine is nordrassil.sh and the lib/ files it sources: functions and
+# source checks are read from all of them, in one file.
+SRC="$T/engine-src.sh"; cat "$ENG" "$(dirname "$ENG")"/lib/*.sh > "$SRC" 2>/dev/null
 # Stubs shadow the real clients and orchestrators: no test here may reach a
 # database, a docker socket or a cluster.
 export PATH="${TEST_DIR}/stubs:$PATH"
@@ -23,7 +26,7 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
 chk()  { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 hdr()  { printf '\n\033[36m== %s\033[0m\n' "$1"; }
 # grab <fn...> — pull named functions out of the engine without running it.
-grab() { local f; for f in "$@"; do sed -n "/^${f}() {/,/^}/p" "$ENG"; done; }
+grab() { local f; for f in "$@"; do sed -n "/^${f}() {/,/^}/p" "$SRC"; done; }
 
 # Fresh config tree per case. XDG_RUNTIME_DIR too: the password cache lives
 # there and the real one must not be touched.
@@ -118,8 +121,8 @@ chk "  and is not split on the space"        '! grep -qx "/app/my" "$T/rec.log"'
 chk "  sh gets it as \$1, not inline"        'grep -qx '"'"'cat > "$1"'"'"' "$T/rec.log"'
 
 hdr "N11 — 'targets' is no longer an array and a string at once"
-chk "restore names its own local"            'grep -q "local overwrites=" "$ENG"'
-chk "the array uses remain untouched"        '[[ "$(grep -c "targets+=(" "$ENG")" -ge 3 ]]'
+chk "restore names its own local"            'grep -q "local overwrites=" "$SRC"'
+chk "the array uses remain untouched"        '[[ "$(grep -c "targets+=(" "$SRC")" -ge 3 ]]'
 
 printf '\n\033[36m== totals\033[0m\n  pass=%s fail=%s\n' "$pass" "$fail"
 printf '  tree: %s\n' "$T"
