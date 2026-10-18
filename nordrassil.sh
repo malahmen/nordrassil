@@ -187,6 +187,11 @@ CLIENT_BUILD_DEFAULT=5875
 # FindACE.cmake has no version floor/ceiling of its own, so an untested newer
 # ACE could silently drop an API this codebase still uses.
 ACE_BUILD_VERSION="8.0.7"
+# The release tarball's sha256, checked before anything is extracted - bump it
+# with the version. GitHub publishes it as the asset's digest:
+#   curl -s https://api.github.com/repos/DOCGroup/ACE_TAO/releases/tags/ACE%2BTAO-<ver_us> | grep -A1 '"name": "ACE-<ver>.tar.gz"'
+# (8.0.7's also matched the md5 in the release's ACE-8.0.7.tar.gz.md5.)
+ACE_BUILD_SHA256="017fa5c7499e3c8f98921f86e007cda7c41c14a926447abbe5a7c5e7960480c7"
 # Shared across projects/repos on this machine, NOT under CONFIG_DIR — ACE
 # itself has nothing project-specific about it, so every fork/port of this
 # script (this one included — ported from vanilla-wow-server) reuses the same
@@ -249,6 +254,7 @@ cfg_set() {
     # stored at all.
     [[ "$key" != "MANAGED_EXTERNALLY" || "$val" =~ ^[01]$ ]] \
         || error_exit "set: MANAGED_EXTERNALLY must be 0 or 1 (got '${val}') — 1 means something else provisions this server."
+    _setting_problem "$key" "$val" || error_exit "set: ${key} must be ${_why} (got '${val}')."
     quoted="\"${val}\""
     local file dir; file="$(_cfg_target)"; dir="$(dirname "$file")"
     # Only PROFILE_DIR is tightened. The base file's directory IS CONFIG_DIR,
@@ -360,6 +366,49 @@ SETTING_KEYS=(
     DB_TRANSPORT SERVER_TRANSPORT DB_POD_SELECTOR SERVER_POD_SELECTOR SERVER_FIFO
     DB_SSH_HOST SERVER_SSH_HOST SERVER_K8S_CONTAINER MANAGED_EXTERNALLY
 )
+
+# _setting_problem <key> <value> — for a numeric setting, sets _why to what
+# the value must be and returns 1 when it is not that; any other key passes.
+# These go unquoted into SQL (realmlist, the search queries), into sed
+# replacements over the conf files and into the k8s YAML, so a typo there
+# breaks the server's config instead of being refused. A global, not $(...):
+# _require_valid_settings runs it for every key on every command.
+_setting_problem() {
+    local key="$1" val="$2"
+    _why=""
+    case "$key" in
+        DB_PORT|REALM_PORT|WORLD_PORT)
+            [[ "$val" =~ ^[0-9]{1,5}$ ]] && (( 10#$val >= 1 && 10#$val <= 65535 )) \
+                || _why="a port, 1-65535" ;;
+        REALM_ID|REALM_ZONE|GAME_TYPE|WOW_PATCH|CLIENT_BUILD|WRONG_PASS_MAX_COUNT|WRONG_PASS_BAN_TIME|WRONG_PASS_BAN_TYPE)
+            [[ "$val" =~ ^[0-9]{1,9}$ ]] || _why="a whole number, 0 or more" ;;
+        # mangosd.conf: 0 = no limit, -1/-2/-3 = staff only.
+        PLAYER_LIMIT)
+            [[ "$val" =~ ^(-[1-3]|[0-9]{1,9})$ ]] || _why="a whole number, or -1, -2 or -3 for staff only" ;;
+        REQ_EMAIL_VERIFICATION|STRICT_VERSION_CHECK|WARDEN_ENABLED)
+            [[ "$val" =~ ^[01]$ ]] || _why="0 or 1" ;;
+        STRICT_PLAYER_NAMES)
+            [[ "$val" =~ ^[0-3]$ ]] || _why="0, 1, 2 or 3" ;;
+        XP_RATE|DROP_RATE)
+            [[ "$val" =~ ^[0-9]{1,6}(\.[0-9]{1,6})?$ ]] || _why="a number such as 1, 2 or 0.5" ;;
+    esac
+    [[ -z "$_why" ]]
+}
+
+# A bad value already stored - by hand, or before cfg_set checked - stops
+# every command that would write it somewhere. Not the ones that read or fix
+# the config: MANAGED_EXTERNALLY showed what a fatal check in _settings does
+# when 'set' itself cannot run past it.
+_require_valid_settings() {
+    case "${SUBCMD:-}" in set|get|config|profiles|forget) return 0 ;; esac
+    local k bad=0
+    for k in "${SETTING_KEYS[@]}"; do
+        _setting_problem "$k" "${!k}" && continue
+        warn "${k}='${!k}' is not ${_why}."
+        bad=1
+    done
+    (( bad == 0 )) || error_exit "Not using a setting that would break the conf files, SQL or manifests. Fix it with: ${0##*/} ${PROFILE:+--profile ${PROFILE} }set KEY VALUE"
+}
 
 _settings() {
     # Paths the front-end may hand over with a literal leading '~' (a quoted
@@ -491,6 +540,7 @@ _settings() {
     K8S_DB_HOSTPATH="$(cfg_default K8S_DB_HOSTPATH /var/vanilla-wow-mariadb)"
     K8S_DB_HOSTPATH="${K8S_DB_HOSTPATH/#\~/$HOME}"
     K8S_STORAGECLASS="$(cfg_default K8S_STORAGECLASS "")"
+    _require_valid_settings
 }
 
 # -----------------------------------------------------------------------------
@@ -539,6 +589,16 @@ _build_ace_from_source() {
     info "Downloading ACE ${ACE_BUILD_VERSION}..."
         curl -fsSL -o "$tarball" "$url" \
         || { warn "Failed to download ACE source from ${url}."; return 1; }
+
+    # Before tar: the build runs make in what this unpacks.
+    local got; got="$(sha256sum "$tarball" | cut -d' ' -f1)"
+    if [[ "$got" != "$ACE_BUILD_SHA256" ]]; then
+        rm -f "$tarball"
+        warn "ACE ${ACE_BUILD_VERSION} download does not match its pinned sha256 - not extracting it."
+        warn "  expected ${ACE_BUILD_SHA256}"
+        warn "  got      ${got}"
+        return 1
+    fi
 
     info "Extracting ACE..."
         tar -xzf "$tarball" -C "$deps_dir" \
@@ -3433,6 +3493,7 @@ main() {
     # Named subcmd, not cmd: 'cmd' is a local ARRAY in the _db_run helpers, and
     # SC2178 reads that reuse across the file as one variable.
     local subcmd="$1"; shift
+    SUBCMD="$subcmd"   # for _require_valid_settings
     # After the flags, before the command: 'set' may create a profile, every
     # other command must find one.
     _profile_require "$subcmd"

@@ -29,7 +29,9 @@ Two independent paths, one shared database bootstrap:
   The ACE toolkit (a hard build dependency) isn't packaged for Fedora/RHEL, so
   `install-deps` builds it from source there instead, cached in
   `~/.cache/ace-wrappers/<version>/` (shared across checkouts, versioned so an
-  ACE bump can't reuse a stale build); apt hosts use `libace-dev`.
+  ACE bump can't reuse a stale build); apt hosts use `libace-dev`. The
+  tarball is checked against a pinned sha256 (`ACE_BUILD_SHA256`, bumped with
+  the version) before it is unpacked.
 - **Container** (`build-image` / `run-docker` / `run-k8s`): compiles inside an
   Ubuntu build stage regardless of host OS, so it works everywhere Docker does.
   This is the actual LAN-deployable artifact. k8s uses `hostNetwork` so the
@@ -379,6 +381,12 @@ one setting per line), with per-server overrides in
 Read/write it with `get`/`set`/`config`; commands read it back on every run and
 fall back to sane defaults for anything unset.
 
+The numeric settings are checked: ports are 1-65535, the 0/1 switches 0 or 1,
+`STRICT_PLAYER_NAMES` 0-3, `PLAYER_LIMIT` a whole number or -1/-2/-3, the
+rates a number such as `1.5`, the rest whole numbers. `set` refuses anything
+else. A bad value already in the file (edited by hand) stops every command
+except `set`, `get`, `config`, `profiles` and `forget`, so it can still be fixed.
+
 | Key | Default | Notes |
 | --- | --- | --- |
 | `SOURCE_DIR` | `~/jaws/MaNGOS` | repack root (must contain the source + `mangosd.conf`/`realmd.conf`) |
@@ -416,16 +424,15 @@ NORDRASSIL=/path/to/nordrassil.sh tests/run-all.sh
 tests/test-profiles.sh                # one of them
 ```
 
-**130 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
+**171 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
 `mariadb-dump`, `docker` and `kubectl` on PATH, and every test works in its own
 `XDG_CONFIG_HOME` under a temporary directory — so a run cannot reach a
 database, a docker socket, a cluster, or the config in `~/.config/nordrassil`.
 One assertion checks that last part directly.
 
-| File | What it covers |
-| ---- | -------------- |
 | File | Checks | What it covers |
 | ---- | -----: | -------------- |
+| `test-settings-entrypoint-ace.sh` | 41 | numeric settings refused by `set` and, when already stored, by every command that would use them; the entrypoint stops the other server when one dies; the ACE tarball is checked before it is unpacked |
 | `test-profiles.sh` | 33 | a profile that does not exist is refused; `--no-profile`; 0600 files in 0700 directories; `MANAGED_EXTERNALLY` cannot brick the tool |
 | `test-db-password.sh` | 28 | `DB_PASS=ask` resolves instead of reaching a conf file as the literal string; verify-then-cache, and its three answers; the prompt survives having no terminal |
 | `test-provisioning-guard.sh` | 26 | provisioning refuses a profile pointing elsewhere, `--kind`/`--context` still work, administration is unaffected |
