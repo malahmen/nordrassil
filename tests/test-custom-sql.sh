@@ -10,6 +10,9 @@ ENG="${NORDRASSIL:-${TEST_DIR}/../nordrassil.sh}"
 [ -f "$ENG" ] || { echo "nordrassil.sh not found at $ENG" >&2; exit 1; }
 R="$(dirname "$ENG")"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# The engine is nordrassil.sh and the lib/ files it sources: functions and
+# source checks are read from all of them, in one file.
+SRC="$T/engine-src.sh"; cat "$ENG" "$(dirname "$ENG")"/lib/*.sh > "$SRC" 2>/dev/null
 # Stubs shadow the real clients and orchestrators: no test here may reach a
 # database, a docker socket or a cluster.
 export PATH="${TEST_DIR}/stubs:$PATH"
@@ -52,7 +55,7 @@ bootstrap() {   # bootstrap <CUSTOM_SQL> <engine-path>  -> prints a call log
   )
 }
 hdr "P1-7 — the engine applies only what was selected, and marks only what worked"
-log="$(bootstrap "GOOD,BREAKS" "$ENG")"
+log="$(bootstrap "GOOD,BREAKS" "$SRC")"
 chk "the selected script is imported"        'grep -q "^import GOOD.sql" <<<"$log"'
 chk "  and marked applied"                   'grep -q "^mark custom:GOOD.sql" <<<"$log"'
 chk "a FAILED script is not marked"          'grep -q "import-FAILED BREAKS.sql" <<<"$log" && ! grep -q "mark custom:BREAKS.sql" <<<"$log"'
@@ -61,7 +64,7 @@ chk "an unselected script is left alone"     '! grep -qE "(import|mark).*UNSELEC
 chk "START_ON_GM_ISLAND is never applied"    '! grep -q "START_ON_GM_ISLAND" <<<"$log"'
 
 hdr "P1-7 — 'cannot tell' skips rather than re-imports"
-log2="$(bootstrap "UNREADABLE,GOOD" "$ENG")"
+log2="$(bootstrap "UNREADABLE,GOOD" "$SRC")"
 chk "the unreadable-state script is skipped" '! grep -qE "(import|mark).*UNREADABLE" <<<"$log2"'
 chk "  and reported"                         'grep -q "Cannot tell whether UNREADABLE.sql" <<<"$log2"'
 chk "the other script still applies"         'grep -q "^import GOOD.sql" <<<"$log2"'

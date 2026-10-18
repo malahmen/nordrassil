@@ -10,6 +10,9 @@ TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENG="${NORDRASSIL:-${TEST_DIR}/../nordrassil.sh}"
 [ -f "$ENG" ] || { echo "nordrassil.sh not found at $ENG" >&2; exit 1; }
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# The engine is nordrassil.sh and the lib/ files it sources: functions and
+# source checks are read from all of them, in one file.
+SRC="$T/engine-src.sh"; cat "$ENG" "$(dirname "$ENG")"/lib/*.sh > "$SRC" 2>/dev/null
 # Stubs shadow the real clients and orchestrators: no test here may reach a
 # database, a docker socket or a cluster.
 export PATH="${TEST_DIR}/stubs:$PATH"
@@ -22,7 +25,7 @@ chk(){ if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 hdr(){ printf '\n\033[36m== %s\033[0m\n' "$1"; }
 
 # Pull named functions out of the engine without running it.
-grab() { local f; for f in "$@"; do sed -n "/^${f}() {/,/^}/p" "$ENG"; done; }
+grab() { local f; for f in "$@"; do sed -n "/^${f}() {/,/^}/p" "$SRC"; done; }
 
 # ---------------------------------------------------------------- N3: conf files
 hdr "N3 — DB_PASS=ask must not reach a conf file"
@@ -114,7 +117,7 @@ chk "  created 0700"                         '[[ -d "$d1" && "$(stat -c %a "$d1"
 # has /run/user/<uid>, so it is left to the code and its comment.)
 d2="$( unset XDG_RUNTIME_DIR; cachedir )"
 chk "falls back to /run/user/<uid>"          '[[ "$d2" == "/run/user/$(id -u)/nordrassil" ]]'
-chk "  and never to /tmp"                    '! grep -qE "TMPDIR|/tmp" <<<"$(sed -n "/^_db_pw_cache_dir() {/,/^}/p" "$ENG")"'
+chk "  and never to /tmp"                    '! grep -qE "TMPDIR|/tmp" <<<"$(sed -n "/^_db_pw_cache_dir() {/,/^}/p" "$SRC")"'
 
 hdr "N9 — verify, THEN cache"
 # Driven through the real _db_password with the prompt and the check both
@@ -156,7 +159,7 @@ hdr "N9 — the prompt survives EOF (bash 3.2 left pw unset)"
 # set -u aborted with "pw: unbound variable" instead.
 noterm="$( setsid bash -c '
     set -uo pipefail
-    eval "$(sed -n "/^_db_prompt_password() {/,/^}/p" "'"$ENG"'")"
+    eval "$(sed -n "/^_db_prompt_password() {/,/^}/p" "'"$SRC"'")"
     warn(){ printf "%s\n" "$*"; }
     _db_prompt_password; printf "rc=%s" "$?"
 ' 2>&1 )"

@@ -17,6 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: test-settings-entrypoint-ace.sh runs the code as it
+          # was before its fix (fd422c6) to show the bug was real, and skips
+          # that half in a shallow clone.
+          fetch-depth: 0
 
       - name: Versions
         # Printed because a suite that behaves differently on the runner than
@@ -31,7 +36,7 @@ jobs:
 
       - name: shellcheck
         run: |
-          shellcheck -S warning nordrassil.sh templates/entrypoint.sh tests/run-all.sh tests/test-custom-sql.sh tests/test-db-password.sh tests/test-dump.sh tests/test-profiles.sh tests/test-provisioning-guard.sh tests/test-restore-scope.sh tests/test-settings-entrypoint-ace.sh
+          shellcheck -x -S warning nordrassil.sh templates/entrypoint.sh tests/run-all.sh tests/test-custom-sql.sh tests/test-db-password.sh tests/test-dump.sh tests/test-profiles.sh tests/test-provisioning-guard.sh tests/test-restore-scope.sh tests/test-settings-entrypoint-ace.sh
 
       - name: tests
         run: tests/run-all.sh

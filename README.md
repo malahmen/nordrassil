@@ -60,13 +60,25 @@ and says so.
 
 ## Install / usage
 
-`nordrassil.sh` is a self-contained Bash script (plus a `templates/` directory
-of Dockerfile / entrypoint / k8s manifests / source patches). No `gum`, no
-`_common` — clone and run:
+`nordrassil.sh` is a Bash script with its code in `lib/` and a `templates/`
+directory of Dockerfile / entrypoint / k8s manifests / source patches. It runs
+from its checkout, next to both. No `gum`, no `_common` — clone and run:
 
 ```sh
 ./nordrassil.sh help        # same as -h / --help
 ```
+
+| File | What is in it |
+| ---- | ------------- |
+| `nordrassil.sh` | the entry point: global flags, `usage`, command dispatch; sources the rest in this order |
+| `lib/common.sh` | logging, package and pidfile helpers, the kube target flags, escaping |
+| `lib/config.sh` | paths, the config store and profiles, the resolved settings; `set`, `get`, `config`, `forget`, `profiles` |
+| `lib/transport.sh` | reaching the database and the server: ssh, kubectl, docker/podman exec, the password, the console FIFO |
+| `lib/provision.sh` | the one gate every provisioning command passes (`_require_owned_target`), the local MariaDB, the conf files; `configure`, `edit` |
+| `lib/db.sh` | the bootstrap and its bookkeeping, realmlist; `apply-sql`, `dump`, `restore`, `list-custom` |
+| `lib/native.sh` | the native build: `install-deps` and ACE, the source and its patches; `start`, `stop` |
+| `lib/deploy.sh` | containers: `build-image`, `run-docker`, `stop-docker`, `run-k8s`, `stop-k8s` |
+| `lib/admin.sh` | a running server, wherever it is: `status`, accounts, characters, `search`, `restart` |
 
 ### Global flags (kube target for `run-k8s` / `stop-k8s`)
 
@@ -424,7 +436,7 @@ NORDRASSIL=/path/to/nordrassil.sh tests/run-all.sh
 tests/test-profiles.sh                # one of them
 ```
 
-**171 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
+**181 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
 `mariadb-dump`, `docker` and `kubectl` on PATH, and every test works in its own
 `XDG_CONFIG_HOME` under a temporary directory — so a run cannot reach a
 database, a docker socket, a cluster, or the config in `~/.config/nordrassil`.
@@ -433,9 +445,9 @@ One assertion checks that last part directly.
 | File | Checks | What it covers |
 | ---- | -----: | -------------- |
 | `test-settings-entrypoint-ace.sh` | 41 | numeric settings refused by `set` and, when already stored, by every command that would use them; the entrypoint stops the other server when one dies; the ACE tarball is checked before it is unpacked |
+| `test-provisioning-guard.sh` | 36 | provisioning refuses a profile pointing elsewhere, `--kind`/`--context` still work, administration is unaffected; every provisioning command goes through the one gate |
 | `test-profiles.sh` | 33 | a profile that does not exist is refused; `--no-profile`; 0600 files in 0700 directories; `MANAGED_EXTERNALLY` cannot brick the tool |
 | `test-db-password.sh` | 28 | `DB_PASS=ask` resolves instead of reaching a conf file as the literal string; verify-then-cache, and its three answers; the prompt survives having no terminal |
-| `test-provisioning-guard.sh` | 26 | provisioning refuses a profile pointing elsewhere, `--kind`/`--context` still work, administration is unaffected |
 | `test-dump.sh` | 19 | `--default-character-set`, the 0600 dump file, the stream guard that rejects output something else wrote into, and the target banner |
 | `test-custom-sql.sh` | 16 | only the selected Custom scripts are applied and only successful ones recorded, in the engine and in the k8s Job (that half needs PyYAML and skips without it) |
 | `test-restore-scope.sh` | 8 | `--db` is refused on a dump that names its own databases |
@@ -446,7 +458,8 @@ test suite that cannot fail is the bug it is supposed to catch.
 
 ### CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `shellcheck` and
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `shellcheck` (with
+`-x`, so `nordrassil.sh` is checked together with the `lib/` files it sources) and
 the whole suite on every push to `main`, every pull request, and on demand
 (`workflow_dispatch`). It needs no secrets and no services — that is the point
 of the stubs — and installs only PyYAML, for the half of `test-custom-sql.sh`
