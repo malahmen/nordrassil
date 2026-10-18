@@ -31,12 +31,12 @@ jobs:
           git --version
           shellcheck --version | sed -n 2p
 
-      - name: PyYAML, for the k8s Job half of test-custom-sql
+      - name: PyYAML, for the k8s Job manifest check in test-custom-sql
         run: python3 -m pip install --quiet pyyaml
 
       - name: shellcheck
         run: |
-          shellcheck -x -S warning nordrassil.sh templates/entrypoint.sh tests/run-all.sh tests/test-custom-sql.sh tests/test-db-password.sh tests/test-dump.sh tests/test-profiles.sh tests/test-provisioning-guard.sh tests/test-restore-scope.sh tests/test-settings-entrypoint-ace.sh
+          shellcheck -x -S warning nordrassil.sh templates/entrypoint.sh templates/k8s/db-init.sh tests/run-all.sh tests/test-custom-sql.sh tests/test-db-password.sh tests/test-dump.sh tests/test-profiles.sh tests/test-provisioning-guard.sh tests/test-restore-scope.sh tests/test-settings-entrypoint-ace.sh
 
       - name: tests
         run: tests/run-all.sh

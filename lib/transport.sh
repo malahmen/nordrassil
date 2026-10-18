@@ -505,9 +505,9 @@ _server_transport() {
     printf '%s' "$chosen"
 }
 
-# Escapes a value for embedding inside a single-quoted SQL string literal
-# (backslash first, so it isn't double-escaped by the quote pass after it).
-_sql_escape() { printf '%s' "$1" | sed -e "s/\\\\/\\\\\\\\/g" -e "s/'/\\\\'/g"; }
+# Escapes a value for embedding inside a single-quoted SQL string literal.
+# lib/bootstrap.sh's, so the engine and the k8s Job escape the same way.
+_sql_escape() { bs_sql_escape "$1"; }
 
 # _kube_mariadb <mariadb args...> — runs the mariadb client in the cluster's
 # MariaDB pod. 'kubectl exec' has no --env of its own, so the password is

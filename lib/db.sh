@@ -5,7 +5,7 @@
 # Part of nordrassil.sh, which sources it; not meant to run on its own.
 
 # -----------------------------------------------------------------------------
-# Import bookkeeping — realmd.nordrassil_applied
+# Import bookkeeping and the bootstrap — realmd.nordrassil_applied
 #
 # Which dumps/migrations have been imported is a property OF THE DATABASE, so
 # that is where it is recorded: one row per applied item in
@@ -15,58 +15,25 @@
 # import still looked "already done" against an empty database, leaving
 # mangosd unable to start against schemas that were never created.
 #
-# Row names: "base", "anticheat", "world-full", "migration:<file>.sql",
-# "custom:<file>.sql". Every name goes through _sql_escape, like every other
-# string literal this script sends.
-#
-# All three helpers talk to the local MariaDB container (_db_exec/_db_query_raw
-# with the "docker" target — local and docker share that one container); the
-# k8s deployment keeps the same table, written by its own db-init Job.
+# The bootstrap itself and the bookkeeping are lib/bootstrap.sh, which the
+# k8s db-init Job runs too. What is here is how the engine plugs into it: the
+# bs_* hooks over this script's transports, and the _db_* names the rest of
+# the engine (apply-sql) uses for the same bookkeeping.
 # -----------------------------------------------------------------------------
 
-# _db_table_exists <database> <table>
-_db_table_exists() {
-    local out
-    out="$(_db_query_raw "SHOW TABLES FROM ${1} LIKE '$(_sql_escape "$2")';" 2>/dev/null)" || out=""
-    [[ -n "$out" ]]
-}
+bs_sql_exec()   { _db_exec "$1"; }
+bs_sql_query()  { _db_query_raw "$1"; }
+bs_sql_import() { _db_import "$1" "$2"; }
+bs_info()       { info "$@"; }
+bs_ok()         { success "$@"; }
+bs_warn()       { warn "$@"; }
+bs_die()        { error_exit "$@"; }
+bs_seed_untracked() { _db_seed_applied_from_markers; }
 
-# _db_is_applied <name>
-# Returns 0 = applied, 1 = not applied, 2 = the question could not be
-# answered. The third state is the point of this function.
-#
-# It used to collapse a query ERROR into "not applied" (`|| out=""`), which is
-# the dangerous direction: an unreachable database, a failed login or a
-# missing table made every import look pending, so the next step re-imported
-# the world dump and re-ran every Custom script on top of live data. An empty
-# result and a failed query are different answers and callers need to tell
-# them apart — see _db_applied_or_die.
-_db_is_applied() {
-    local out rc=0
-    out="$(_db_query_raw "SELECT 1 FROM realmd.nordrassil_applied WHERE name='$(_sql_escape "$1")' LIMIT 1;" 2>/dev/null)" || rc=$?
-    [[ $rc -eq 0 ]] || return 2
-    [[ -n "$out" ]]
-}
-
-# _db_applied_or_die <name> — _db_is_applied, with "cannot tell" fatal.
-#
-# For every import in _db_bootstrap the alternative to knowing is writing on
-# top of whatever is already there, so not knowing has to stop the run. The
-# bookkeeping table is created (with its own error_exit) before the first of
-# these calls, so a failure here is a real one and not a fresh database.
-_db_applied_or_die() {
-    local st=0
-    _db_is_applied "$1" || st=$?
-    [[ $st -ne 2 ]] || error_exit "Could not read the import state of '${1}' from realmd.nordrassil_applied. Refusing to continue — the next step would import on top of whatever is already in the database."
-    return $st
-}
-
-# _db_mark_applied <name> — INSERT IGNORE so a re-run after a partial failure
-# doesn't error out on the primary key.
-_db_mark_applied() {
-    _db_exec "INSERT IGNORE INTO realmd.nordrassil_applied (name) VALUES ('$(_sql_escape "$1")');" >/dev/null \
-        || warn "Could not record '${1}' as applied — it will be imported again on the next run."
-}
+_db_table_exists()   { bs_table_exists "$@"; }
+_db_is_applied()     { bs_applied "$@"; }
+_db_applied_or_die() { bs_applied_or_die "$@"; }
+_db_mark_applied()   { bs_mark "$@"; }
 
 # _db_seed_applied_from_markers — one-time transition for deployments
 # bootstrapped by the marker-file version of this script: the tracking table
@@ -106,176 +73,10 @@ _db_seed_applied_from_markers() {
     return 0
 }
 
-# _db_bootstrap — creates schemas, imports Base + world dump + Migrations
-# (idempotent via the realmd.nordrassil_applied table), optionally applies
-# sql/Custom/*.sql.
+# _db_bootstrap — lib/bootstrap.sh's bs_run against SOURCE_DIR/sql, over
+# this script's DB transport. Used by 'configure' and 'run-docker'.
 _db_bootstrap() {
-    local sql_dir="${SOURCE_DIR}/sql"
-    [[ -d "$sql_dir" ]] || error_exit "sql/ directory not found under SOURCE_DIR: ${sql_dir}"
-
-    info "Creating databases (realmd, mangos, characters, logs) if missing..."
-    _db_exec "CREATE DATABASE IF NOT EXISTS realmd; CREATE DATABASE IF NOT EXISTS mangos; CREATE DATABASE IF NOT EXISTS characters; CREATE DATABASE IF NOT EXISTS logs;"
-
-    # Import bookkeeping table (see the block above _db_bootstrap). Whether it
-    # already existed has to be known BEFORE creating it: its absence on an
-    # otherwise-populated database is exactly the upgrade case that needs the
-    # old host-side markers translated into rows.
-    local had_tracking=0
-    _db_table_exists realmd nordrassil_applied && had_tracking=1
-    _db_exec "CREATE TABLE IF NOT EXISTS realmd.nordrassil_applied (name VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);" \
-        || error_exit "Failed to create realmd.nordrassil_applied (the import bookkeeping table)."
-    [[ $had_tracking -eq 1 ]] || _db_seed_applied_from_markers
-
-    if ! _db_applied_or_die base; then
-        info "Importing base schemas (sql/Base/*.sql)..."
-        info "Importing sql/Base/logon.sql -> realmd..."
-        # Was an inline 'bash -c' that redefined _db_import with the password
-        # spliced into the child shell's own command line — the same argv
-        # exposure, twice over. The real _db_import does exactly this.
-        _db_import realmd "${sql_dir}/Base/logon.sql" \
-            || error_exit "Failed to import Base/logon.sql"
-        _db_import mangos     "${sql_dir}/Base/world.sql"
-        _db_import characters "${sql_dir}/Base/characters.sql"
-        _db_import logs       "${sql_dir}/Base/logs.sql"
-        _db_mark_applied base
-        success "Base schemas imported."
-    else
-        info "Base schemas already imported (recorded in the database) — skipping."
-    fi
-
-    # sql/Anticheat/*.sql — despite living next to the optional Custom/
-    # content, this is REQUIRED: the repack's Anticheat/Warden/antispam
-    # features are always compiled in and mangosd hard-crashes at startup
-    # (uncaught C++ exception) if e.g. realmd.antispam_blacklist doesn't
-    # exist. Same per-database file naming as Base/.
-    if [[ -d "${sql_dir}/Anticheat" ]] && ! _db_applied_or_die anticheat; then
-        info "Importing anticheat schemas (sql/Anticheat/*.sql) — required, not optional..."
-        _db_import realmd     "${sql_dir}/Anticheat/realmd.sql"
-        _db_import mangos     "${sql_dir}/Anticheat/world.sql"
-        _db_import characters "${sql_dir}/Anticheat/characters.sql"
-        _db_mark_applied anticheat
-        success "Anticheat schemas imported."
-    else
-        info "Anticheat schemas already imported (recorded in the database) — skipping."
-    fi
-
-    if ! _db_applied_or_die world-full; then
-        local dump="${sql_dir}/world_full_14_june_2021.sql"
-        [[ -f "$dump" ]] || error_exit "World dump not found: ${dump}"
-        warn "Importing the full world dump (~250MB) — this can take several minutes."
-        info "Importing world_full_14_june_2021.sql..."
-        # The file's existence is checked above, so _db_import's skip-if-missing
-        # path can't swallow anything here.
-        _db_import mangos "$dump" \
-            || error_exit "Failed to import world_full_14_june_2021.sql"
-        _db_mark_applied world-full
-        success "World dump imported."
-    else
-        info "World dump already imported (recorded in the database) — skipping."
-    fi
-
-    # Migrations/ holds per-migration files for all 4 databases, distinguished
-    # by suffix (_world.sql -> mangos, _characters.sql -> characters,
-    # _logon.sql -> realmd, _logs.sql -> logs), each with a numeric timestamp
-    # prefix. It also holds 4 pre-merged "*_db_updates.sql" aggregates (one
-    # per database, presumably produced by merge.sh/merge.bat from the
-    # individual files) and merge.bat/merge.sh/README — none of those have a
-    # numeric prefix, and applying the aggregates on top of the individual
-    # migrations would double-apply the same changes, so both are excluded
-    # by requiring the ^[0-9]+_ prefix.
-    local mfile mname target_db applied=0 skipped=0
-    while IFS= read -r mfile; do
-        [[ -z "$mfile" ]] && continue
-        mname="$(basename "$mfile")"
-        if _db_applied_or_die "migration:${mname}"; then
-            skipped=$((skipped + 1))
-            continue
-        fi
-        case "$mname" in
-            *_world.sql)      target_db=mangos ;;
-            *_characters.sql) target_db=characters ;;
-            *_logon.sql)      target_db=realmd ;;
-            *_logs.sql)       target_db=logs ;;
-            *) warn "Skipping migration with unrecognized suffix: ${mname}"; continue ;;
-        esac
-        _db_import "$target_db" "$mfile" || error_exit "Migration failed: ${mname} (target db: ${target_db})"
-        _db_mark_applied "migration:${mname}"
-        applied=$((applied + 1))
-    done < <(find "${sql_dir}/Migrations" -maxdepth 1 -name "[0-9]*.sql" 2>/dev/null | sort)
-    info "Migrations: ${applied} applied, ${skipped} already up to date."
-
-    # Custom/*.sql is a grab-bag, not one coherent feature — this repack's
-    # own copy includes both ADD_GM_ISLAND_VENDORS.sql and its counterpart
-    # REMOVE_GM_ISLAND_VENDORS.sql (applying both back-to-back in filename
-    # order is a no-op at best), several bonus legendary items, and
-    # START_ON_GM_ISLAND.sql, a one-line blanket UPDATE with no WHERE
-    # clause that overwrites playercreateinfo for every race/class to the
-    # same coordinates — every new character, GM or not, spawns on GM
-    # Island instead of its actual racial starting zone. A single
-    # "apply optional custom content?" yes/no (what this used to be) hides
-    # that entirely behind vague wording ("vendors/trainers, custom items")
-    # and applies everything found, found live when a user asked why every
-    # character was spawning in the wrong place. Listing each file lets the
-    # operator actually choose, and skips files already applied so a later
-    # 'configure' run doesn't re-prompt for the same ones.
-    # The engine applies exactly the scripts named in CUSTOM_SQL (comma- or
-    # space-separated basenames, without .sql) — the front-end shows the operator
-    # the available list (see 'list-custom') and sets this. Anything not listed is
-    # skipped; files already applied (recorded in the DB) are never re-applied.
-    if [[ -d "${sql_dir}/Custom" && -n "${CUSTOM_SQL:-}" ]]; then
-        local want cfile st applied_custom=0 failed_custom=0
-        local wanted="${CUSTOM_SQL//,/ }"
-        for want in $wanted; do
-            want="${want%.sql}"
-            cfile="${sql_dir}/Custom/${want}.sql"
-            [[ -f "$cfile" ]] || { warn "Custom script not found, skipping: ${want}.sql"; continue; }
-            st=0; _db_is_applied "custom:${want}.sql" || st=$?
-            if [[ $st -eq 0 ]]; then
-                info "Custom already applied: ${want}.sql"; continue
-            elif [[ $st -eq 2 ]]; then
-                # Not fatal here, unlike the bootstrap imports: one Custom
-                # script is skippable, and the rest of configure is still
-                # worth finishing. Skipped rather than applied, because
-                # applying it twice is the unrecoverable direction.
-                warn "Cannot tell whether ${want}.sql was already applied (the tracking query failed) — skipping it."
-                failed_custom=$((failed_custom + 1)); continue
-            fi
-            if _db_import mangos "$cfile"; then
-                _db_mark_applied "custom:${want}.sql"
-                info "Applied: ${want}.sql"; applied_custom=$((applied_custom + 1))
-            else
-                # NOT marked. It used to be marked regardless of the import's
-                # exit status, so a script that failed halfway was recorded as
-                # done and could never run again — including after it was
-                # fixed, which is exactly when it needs to.
-                warn "Custom script FAILED and was NOT recorded as applied: ${want}.sql"
-                warn "  Fix it and re-run 'configure'; a partial import may need undoing by hand."
-                failed_custom=$((failed_custom + 1))
-            fi
-        done
-        [[ $applied_custom -gt 0 ]] && success "Custom content applied (${applied_custom})."
-        [[ $failed_custom -gt 0 ]] && warn "Custom scripts not applied: ${failed_custom} (see above)."
-    fi
-
-    _ensure_realmlist
-}
-
-# None of the SQL dumps seed the realmlist table — the realm's reachable
-# address/port is inherently deployment-specific, so every MaNGOS-family
-# server needs this set by the operator. Without it mangosd refuses to start
-# ("Config contains invalid realmID"). ON DUPLICATE KEY UPDATE keeps this in
-# sync with the current REALM_ADDRESS/WORLD_PORT/CLIENT_BUILD on every run.
-_ensure_realmlist() {
-    info "Ensuring realmlist row (id=${REALM_ID}, name=${REALM_NAME}, address=${REALM_ADDRESS}:${WORLD_PORT})..."
-    # Both values are operator-supplied free text (the front-end takes them
-    # from a prompt) — escape them like every other string literal here.
-    local name_sql addr_sql
-    name_sql="$(_sql_escape "$REALM_NAME")"; addr_sql="$(_sql_escape "$REALM_ADDRESS")"
-    _db_exec "INSERT INTO realmd.realmlist (id, name, address, localAddress, localSubnetMask, port, gamebuild_min, gamebuild_max)
-        VALUES (${REALM_ID}, '${name_sql}', '${addr_sql}', '127.0.0.1', '255.255.255.0', ${WORLD_PORT}, ${CLIENT_BUILD}, ${CLIENT_BUILD})
-        ON DUPLICATE KEY UPDATE name='${name_sql}', address='${addr_sql}', port=${WORLD_PORT}, gamebuild_min=${CLIENT_BUILD}, gamebuild_max=${CLIENT_BUILD};" \
-        || error_exit "Failed to write the realmlist row."
-    success "realmlist ready."
+    bs_run "${SOURCE_DIR}/sql"
 }
 
 # -----------------------------------------------------------------------------

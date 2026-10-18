@@ -38,9 +38,11 @@ Two independent paths, one shared database bootstrap:
   fixed client-expected ports work without a LoadBalancer.
 
 The database is **always a separate MariaDB container/pod** — never bundled into
-the server image, never installed natively on the host. The same bootstrap
-sequence (schemas + world dump + migrations + optional `sql/Custom` content) is
-reused by `configure` (local dev) and the k8s `db-init` Job.
+the server image, never installed natively on the host. One bootstrap script,
+`lib/bootstrap.sh` (schemas + world dump + migrations + the selected
+`sql/Custom` content + the realmlist row), is run by `configure` and
+`run-docker` over the DB transport, and by the k8s `db-init` Job, which
+`run-k8s` gives it in a ConfigMap with `templates/k8s/db-init.sh`.
 
 Import state is tracked **inside the database**, in `realmd.nordrassil_applied`,
 so what has been imported travels with the data rather than with this host. Each
@@ -75,7 +77,8 @@ from its checkout, next to both. No `gum`, no `_common` — clone and run:
 | `lib/config.sh` | paths, the config store and profiles, the resolved settings; `set`, `get`, `config`, `forget`, `profiles` |
 | `lib/transport.sh` | reaching the database and the server: ssh, kubectl, docker/podman exec, the password, the console FIFO |
 | `lib/provision.sh` | the one gate every provisioning command passes (`_require_owned_target`), the local MariaDB, the conf files; `configure`, `edit` |
-| `lib/db.sh` | the bootstrap and its bookkeeping, realmlist; `apply-sql`, `dump`, `restore`, `list-custom` |
+| `lib/bootstrap.sh` | the database bootstrap and its bookkeeping — the one copy, also run by the k8s Job (see `templates/k8s/db-init.sh`) |
+| `lib/db.sh` | the engine's hooks into the bootstrap; `apply-sql`, `dump`, `restore`, `list-custom` |
 | `lib/native.sh` | the native build: `install-deps` and ACE, the source and its patches; `start`, `stop` |
 | `lib/deploy.sh` | containers: `build-image`, `run-docker`, `stop-docker`, `run-k8s`, `stop-k8s` |
 | `lib/admin.sh` | a running server, wherever it is: `status`, accounts, characters, `search`, `restart` |
@@ -155,8 +158,6 @@ Things worth knowing:
   db-init Job) must be mounted into the kind node with `extraMounts` in the
   cluster config — a kind node is a container and can't see the host's
   filesystem otherwise.
-- The k8s `db-init` Job applies **every** `sql/Custom/*.sql` it finds; the
-  `CUSTOM_SQL` selection only applies to `configure`/`run-docker`.
 
 ### Examples
 
@@ -436,7 +437,7 @@ NORDRASSIL=/path/to/nordrassil.sh tests/run-all.sh
 tests/test-profiles.sh                # one of them
 ```
 
-**181 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
+**186 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
 `mariadb-dump`, `docker` and `kubectl` on PATH, and every test works in its own
 `XDG_CONFIG_HOME` under a temporary directory — so a run cannot reach a
 database, a docker socket, a cluster, or the config in `~/.config/nordrassil`.
@@ -448,8 +449,8 @@ One assertion checks that last part directly.
 | `test-provisioning-guard.sh` | 36 | provisioning refuses a profile pointing elsewhere, `--kind`/`--context` still work, administration is unaffected; every provisioning command goes through the one gate |
 | `test-profiles.sh` | 33 | a profile that does not exist is refused; `--no-profile`; 0600 files in 0700 directories; `MANAGED_EXTERNALLY` cannot brick the tool |
 | `test-db-password.sh` | 28 | `DB_PASS=ask` resolves instead of reaching a conf file as the literal string; verify-then-cache, and its three answers; the prompt survives having no terminal |
+| `test-custom-sql.sh` | 21 | the bootstrap, run by the engine and by the Job's `db-init.sh`: only the selected Custom scripts are applied and only successful ones recorded; the Job's password stays off argv; the Job is wired to the ConfigMap (that check needs PyYAML and skips without it) |
 | `test-dump.sh` | 19 | `--default-character-set`, the 0600 dump file, the stream guard that rejects output something else wrote into, and the target banner |
-| `test-custom-sql.sh` | 16 | only the selected Custom scripts are applied and only successful ones recorded, in the engine and in the k8s Job (that half needs PyYAML and skips without it) |
 | `test-restore-scope.sh` | 8 | `--db` is refused on a dump that names its own databases |
 
 Each file prints `pass=N fail=N` and exits non-zero if anything failed. The
@@ -462,8 +463,8 @@ test suite that cannot fail is the bug it is supposed to catch.
 `-x`, so `nordrassil.sh` is checked together with the `lib/` files it sources) and
 the whole suite on every push to `main`, every pull request, and on demand
 (`workflow_dispatch`). It needs no secrets and no services — that is the point
-of the stubs — and installs only PyYAML, for the half of `test-custom-sql.sh`
-that reads the k8s Job out of its manifest.
+of the stubs — and installs only PyYAML, for the check in `test-custom-sql.sh`
+that reads the k8s Job's wiring out of its manifest.
 
 ## Credits
 

@@ -28,9 +28,9 @@
 #     does. This is the actual LAN-deployable artifact.
 #
 # The database is always a separate MariaDB container/pod — never bundled
-# into the server image, and never installed natively on the host. The same
-# DB bootstrap sequence (schemas + world dump + migrations + optional custom
-# content) is reused by 'configure' (local dev) and the k8s db-init Job.
+# into the server image, and never installed natively on the host. One DB
+# bootstrap, lib/bootstrap.sh (schemas + world dump + migrations + optional
+# custom content), is run by 'configure' and by the k8s db-init Job.
 #
 # Config: ~/.config/nordrassil/nordrassil.conf (XDG-style, key=value). The
 # front-end pushes values with 'set <KEY> <VALUE>'; commands read them back.
@@ -54,6 +54,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/config.sh"
 source "${SCRIPT_DIR}/lib/transport.sh"
 source "${SCRIPT_DIR}/lib/provision.sh"
+source "${SCRIPT_DIR}/lib/bootstrap.sh"
 source "${SCRIPT_DIR}/lib/db.sh"
 source "${SCRIPT_DIR}/lib/native.sh"
 source "${SCRIPT_DIR}/lib/deploy.sh"

@@ -311,6 +311,17 @@ cmd_run_k8s() {
         --dry-run=client -o yaml | kubectl $ctx_flags apply -f - \
         || error_exit "Failed to create the server ConfigMap."
 
+    info "Creating the DB bootstrap ConfigMap..."
+    # The Job runs lib/bootstrap.sh — the bootstrap 'configure' runs — through
+    # templates/k8s/db-init.sh. Created on every deploy, so the Job always runs
+    # this checkout's copy.
+    # shellcheck disable=SC2086
+    kubectl $ctx_flags -n "$K8S_NAMESPACE" create configmap vanilla-wow-db-init \
+        --from-file=bootstrap.sh="${SCRIPT_DIR}/lib/bootstrap.sh" \
+        --from-file=db-init.sh="${k8s_tpl}/db-init.sh" \
+        --dry-run=client -o yaml | kubectl $ctx_flags apply -f - \
+        || error_exit "Failed to create the DB bootstrap ConfigMap."
+
     info "Running DB bootstrap Job (schemas + world dump + migrations)..."
     # A Job's pod template is immutable once created, so re-applying it with
     # anything changed (realm address, password, sql path) fails — delete

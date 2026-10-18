@@ -64,7 +64,11 @@ chk "  and warns about nothing"               '[[ ! -s "$T/pwnew.err" ]]'
 hdr "P1-7 — a query error is not 'not applied'"
 state() {  # state <stub-behaviour> -> prints the rc of _db_is_applied
   (
-    eval "$(grab _sql_escape _db_is_applied _db_applied_or_die)"
+    # The bookkeeping is lib/bootstrap.sh's, behind lib/db.sh's _db_* names.
+    # shellcheck source=../lib/bootstrap.sh
+    source "$(dirname "$ENG")/lib/bootstrap.sh"
+    # shellcheck source=../lib/db.sh
+    source "$(dirname "$ENG")/lib/db.sh"
     warn(){ :; }; error_exit(){ printf 'DIED\n'; exit 9; }
     case "$1" in
       hit)   _db_query_raw(){ echo 1; } ;;
@@ -79,7 +83,11 @@ chk "no row       -> 1 (not applied)"        '[[ "$(state miss)"  == "rc=1" ]]'
 chk "query failed -> 2 (cannot tell)"        '[[ "$(state error)" == "rc=2" ]]'
 die() {
   (
-    eval "$(grab _sql_escape _db_is_applied _db_applied_or_die)"
+    # The bookkeeping is lib/bootstrap.sh's, behind lib/db.sh's _db_* names.
+    # shellcheck source=../lib/bootstrap.sh
+    source "$(dirname "$ENG")/lib/bootstrap.sh"
+    # shellcheck source=../lib/db.sh
+    source "$(dirname "$ENG")/lib/db.sh"
     warn(){ :; }; error_exit(){ printf 'DIED'; exit 9; }
     case "$1" in miss) _db_query_raw(){ :; } ;; error) _db_query_raw(){ return 1; } ;; esac
     _db_applied_or_die x && echo APPLIED || echo "NOT(rc=$?)"
