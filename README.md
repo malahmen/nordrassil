@@ -42,7 +42,11 @@ the server image, never installed natively on the host. One bootstrap script,
 `lib/bootstrap.sh` (schemas + world dump + migrations + the selected
 `sql/Custom` content + the realmlist row), is run by `configure` and
 `run-docker` over the DB transport, and by the k8s `db-init` Job, which
-`run-k8s` gives it in a ConfigMap with `templates/k8s/db-init.sh`.
+`run-k8s` gives it in a ConfigMap with `templates/k8s/db-init.sh`. `run-k8s`
+waits for that Job: when it fails, its last log lines are shown and the server
+is **not** deployed (a server against a half-bootstrapped database only
+restarts); when it is still running after 15 minutes - a big import - the
+server is deployed anyway and restarts until the database is ready.
 
 Import state is tracked **inside the database**, in `realmd.nordrassil_applied`,
 so what has been imported travels with the data rather than with this host. Each
@@ -437,7 +441,7 @@ NORDRASSIL=/path/to/nordrassil.sh tests/run-all.sh
 tests/test-profiles.sh                # one of them
 ```
 
-**186 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
+**191 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
 `mariadb-dump`, `docker` and `kubectl` on PATH, and every test works in its own
 `XDG_CONFIG_HOME` under a temporary directory — so a run cannot reach a
 database, a docker socket, a cluster, or the config in `~/.config/nordrassil`.
@@ -449,7 +453,7 @@ One assertion checks that last part directly.
 | `test-provisioning-guard.sh` | 36 | provisioning refuses a profile pointing elsewhere, `--kind`/`--context` still work, administration is unaffected; every provisioning command goes through the one gate |
 | `test-profiles.sh` | 33 | a profile that does not exist is refused; `--no-profile`; 0600 files in 0700 directories; `MANAGED_EXTERNALLY` cannot brick the tool |
 | `test-db-password.sh` | 28 | `DB_PASS=ask` resolves instead of reaching a conf file as the literal string; verify-then-cache, and its three answers; the prompt survives having no terminal |
-| `test-custom-sql.sh` | 21 | the bootstrap, run by the engine and by the Job's `db-init.sh`: only the selected Custom scripts are applied and only successful ones recorded; the Job's password stays off argv; the Job is wired to the ConfigMap (that check needs PyYAML and skips without it) |
+| `test-custom-sql.sh` | 26 | the bootstrap, run by the engine and by the Job's `db-init.sh`: only the selected Custom scripts are applied and only successful ones recorded; the Job's password stays off argv; the Job is wired to the ConfigMap (that check needs PyYAML and skips without it); `run-k8s` stops on a failed Job instead of waiting it out and deploying |
 | `test-dump.sh` | 19 | `--default-character-set`, the 0600 dump file, the stream guard that rejects output something else wrote into, and the target banner |
 | `test-restore-scope.sh` | 8 | `--db` is refused on a dump that names its own databases |
 
