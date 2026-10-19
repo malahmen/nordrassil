@@ -137,5 +137,30 @@ else
     printf '  \033[33mSKIP\033[0m the manifest structure check (no PyYAML: pip install pyyaml)\n'
 fi
 
+hdr "run-k8s waits for the Job to complete or to fail (Kamino item 109)"
+# _wait_db_init against a kubectl that answers a scripted sequence of the Job's
+# True conditions, one per poll. Polled with no sleep.
+wait_fn="$(sed -n '/^_wait_db_init() {/,/^}/p' "$SRC")"
+waitrun() {   # waitrun TIMEOUT CONDITIONS... -> rc of _wait_db_init, polls in $T/polls
+    local limit="$1"; shift
+    printf '%s\n' "$@" > "$T/conds"; : > "$T/polls"
+    K8S_NAMESPACE=vanilla-wow NORDRASSIL_DB_INIT_POLL=0 NORDRASSIL_DB_INIT_TIMEOUT="$limit" bash -c '
+        kubectl() { local n; n=$(wc -l < "$T/polls"); echo x >> "$T/polls"
+                    sed -n "$((n + 1))p" "$T/conds"; }
+        '"$wait_fn"'
+        _wait_db_init ""' 2>/dev/null
+}
+export T
+waitrun 900 "" "" "FailureTarget Failed "; rc1=$?
+chk "a failed Job ends the wait at once (rc 1)" '[[ $rc1 -eq 1 && $(wc -l < "$T/polls") -eq 3 ]]'
+waitrun 900 "" "Complete "; rc0=$?
+chk "a completed Job ends it (rc 0)"           '[[ $rc0 -eq 0 ]]'
+waitrun 0 "" "" ""; rc2=$?
+chk "still running past the timeout (rc 2)"   '[[ $rc2 -eq 2 ]]'
+body="$(sed -n '/^cmd_run_k8s() {/,/^}/p' "$SRC")"
+chk "run-k8s stops on a failed Job before the server is applied" \
+    'awk "/_wait_db_init/{w=NR} /The DB bootstrap failed/{e=NR} /Applying server deployment/{a=NR} END{exit !(w && e && a && w<e && e<a)}" <<<"$body"'
+chk "  and no longer waits only for condition=complete" '! grep -q "wait --for=condition=complete job/vanilla-wow-db-init" <<<"$body"'
+
 printf '\n  pass=%s fail=%s\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

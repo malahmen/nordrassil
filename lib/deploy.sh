@@ -337,10 +337,18 @@ cmd_run_k8s() {
         "SQL_HOSTPATH=${SOURCE_DIR}/sql" > "$job_manifest"
     # shellcheck disable=SC2086
     kubectl $ctx_flags apply -f "$job_manifest" || error_exit "db-init Job apply failed."
-    # shellcheck disable=SC2086
     info "Waiting for db-init Job to complete (world dump import can take a while)..."
-        kubectl $ctx_flags -n "$K8S_NAMESPACE" wait --for=condition=complete job/vanilla-wow-db-init --timeout=900s \
-        || warn "db-init Job did not complete in time — deploying the server anyway (it restarts until the DB is ready). Check: kubectl -n ${K8S_NAMESPACE} logs job/vanilla-wow-db-init"
+    local init_rc=0
+    _wait_db_init "$ctx_flags" || init_rc=$?
+    case "$init_rc" in
+        1)  # Failed for good (backoffLimit used up): a server against a half-
+            # bootstrapped DB only restarts forever, so it is not deployed.
+            warn "db-init Job failed. Its last lines:"
+            # shellcheck disable=SC2086
+            kubectl $ctx_flags -n "$K8S_NAMESPACE" logs job/vanilla-wow-db-init --tail=30 >&2 || true
+            error_exit "The DB bootstrap failed — the server was NOT deployed. Fix the cause, then run run-k8s again." ;;
+        2)  warn "db-init Job did not complete in time — deploying the server anyway (it restarts until the DB is ready). Check: kubectl -n ${K8S_NAMESPACE} logs job/vanilla-wow-db-init" ;;
+    esac
 
     # Only now that the DB is bootstrapped: the server Deployment.
     info "Applying server deployment..."
@@ -357,6 +365,29 @@ cmd_run_k8s() {
         || warn "Server rollout did not complete. Check: kubectl -n ${K8S_NAMESPACE} get pods"
 
     success "Deployed. hostNetwork pod — reachable on the node's LAN IP: realm ${REALM_PORT}, world ${WORLD_PORT}."
+}
+
+# _wait_db_init CTX_FLAGS — wait for the db-init Job: 0 when it completed, 1
+# when it failed for good (its backoffLimit used up), 2 when it is still
+# running after NORDRASSIL_DB_INIT_TIMEOUT seconds (900). `kubectl wait
+# --for=condition=complete` waited out the full 900s on a Job that had
+# already failed, then deployed anyway (Kamino item 109). Polled every
+# NORDRASSIL_DB_INIT_POLL seconds (5).
+_wait_db_init() {
+    local ctx_flags="$1" waited=0 conds
+    local poll="${NORDRASSIL_DB_INIT_POLL:-5}" limit="${NORDRASSIL_DB_INIT_TIMEOUT:-900}"
+    while :; do
+        # The condition types currently True, space-separated.
+        # shellcheck disable=SC2086
+        conds="$(kubectl $ctx_flags -n "$K8S_NAMESPACE" get job/vanilla-wow-db-init \
+            -o 'jsonpath={range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}' 2>/dev/null)" || conds=""
+        case " ${conds} " in
+            *" Failed "*)   return 1 ;;
+            *" Complete "*) return 0 ;;
+        esac
+        (( waited >= limit )) && return 2
+        sleep "$poll"; waited=$((waited + poll))
+    done
 }
 
 # Scales the server Deployment to 0 — never touches mariadb, the PVCs, or
