@@ -362,7 +362,7 @@ _settings() {
 }
 
 # -----------------------------------------------------------------------------
-# Config subcommands — the front-end (scomp-link's wow-nordrassil TUI) collects
+# Config subcommands — the front-end (scomp-link's wow-vmangos-nordrassil TUI) collects
 # values with gum and pushes them here; the engine itself only ever reads/writes
 # the flat key=value config file. 'set'/'get' expose that store directly so the
 # TUI (or a script) can persist any setting before running build/run commands.
