@@ -6,7 +6,7 @@
 
 # -----------------------------------------------------------------------------
 # Self-contained, gum-free helpers (this is the engine; the scomp-link
-# wow-nordrassil front-end owns all interactivity and drives this by flags).
+# wow-vmangos-nordrassil front-end owns all interactivity and drives this by flags).
 # -----------------------------------------------------------------------------
 if [[ -t 2 ]]; then C_G=$'\033[0;32m'; C_Y=$'\033[0;33m'; C_R=$'\033[0;31m'; C_C=$'\033[0;36m'; C_N=$'\033[0m'
 else C_G=""; C_Y=""; C_R=""; C_C=""; C_N=""; fi

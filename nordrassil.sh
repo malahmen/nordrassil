@@ -7,7 +7,7 @@
 # WoW (1.12.1 / client build 5875) server from the repack at SOURCE_DIR
 # (default ~/jaws/MaNGOS): natively for fast local iteration, and as a
 # Docker/k8s deployment for LAN-wide play. scomp-link ships a thin gum TUI
-# (wow-nordrassil) that drives this by flags; nothing here needs gum.
+# (wow-vmangos-nordrassil) that drives this by flags; nothing here needs gum.
 #
 # The repack ships compiled Windows binaries (mangosd.exe/realmd.exe) and a
 # bundled Windows MySQL, but also its own C++ source

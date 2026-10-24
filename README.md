@@ -12,7 +12,7 @@ a Docker image or Kubernetes deployment for LAN-wide play.
 It has **no interactive prompts**: every command is driven by flags and a flat
 `key=value` config file, so it's equally usable from a shell, a Makefile, CI, or
 cron. [scomp-link](https://github.com/malahmen/scomp-link) ships a thin
-`gum` TUI (**wow-nordrassil**) that collects values and drives this by flags —
+`gum` TUI (**wow-vmangos-nordrassil**) that collects values and drives this by flags —
 that front-end owns all the interactivity, nordrassil owns the logic.
 
 ## What it does
