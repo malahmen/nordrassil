@@ -139,12 +139,16 @@ fi
 
 hdr "run-k8s waits for the Job to complete or to fail (Kamino item 109)"
 # _wait_db_init against a kubectl that answers a scripted sequence of the Job's
-# True conditions, one per poll. Polled with no sleep.
+# True conditions, one per poll. sleep is a no-op and each poll counts as one
+# second, so a wait that misses its condition runs out its TIMEOUT polls and
+# fails the check, rather than looping forever (a poll of 0 never advanced
+# the clock, so a dropped Failed branch hung the suite).
 wait_fn="$(sed -n '/^_wait_db_init() {/,/^}/p' "$SRC")"
 waitrun() {   # waitrun TIMEOUT CONDITIONS... -> rc of _wait_db_init, polls in $T/polls
     local limit="$1"; shift
     printf '%s\n' "$@" > "$T/conds"; : > "$T/polls"
-    K8S_NAMESPACE=vanilla-wow NORDRASSIL_DB_INIT_POLL=0 NORDRASSIL_DB_INIT_TIMEOUT="$limit" bash -c '
+    K8S_NAMESPACE=vanilla-wow NORDRASSIL_DB_INIT_POLL=1 NORDRASSIL_DB_INIT_TIMEOUT="$limit" bash -c '
+        sleep() { :; }
         kubectl() { local n; n=$(wc -l < "$T/polls"); echo x >> "$T/polls"
                     sed -n "$((n + 1))p" "$T/conds"; }
         '"$wait_fn"'
@@ -158,9 +162,48 @@ chk "a completed Job ends it (rc 0)"           '[[ $rc0 -eq 0 ]]'
 waitrun 0 "" "" ""; rc2=$?
 chk "still running past the timeout (rc 2)"   '[[ $rc2 -eq 2 ]]'
 body="$(sed -n '/^cmd_run_k8s() {/,/^}/p' "$SRC")"
-chk "run-k8s stops on a failed Job before the server is applied" \
-    'awk "/_wait_db_init/{w=NR} /The DB bootstrap failed/{e=NR} /Applying server deployment/{a=NR} END{exit !(w && e && a && w<e && e<a)}" <<<"$body"'
-chk "  and no longer waits only for condition=complete" '! grep -q "wait --for=condition=complete job/vanilla-wow-db-init" <<<"$body"'
+chk "run-k8s no longer waits only for condition=complete" '! grep -q "wait --for=condition=complete job/vanilla-wow-db-init" <<<"$body"'
+
+hdr "run-k8s does not deploy the server when the Job failed (Kamino item 206)"
+# The whole of run-k8s, end to end, against a stand-in cluster: a kubectl
+# that records every manifest it is asked to apply and answers the db-init
+# Job's conditions with $STUB_JOB_CONDS, and a docker that has the image.
+# This replaced a check on the order of three lines of cmd_run_k8s, which
+# stayed green with the error_exit below "The DB bootstrap failed" turned
+# into a warn — the server then deployed anyway.
+K="$T/k8s"; mkdir -p "$K/bin" "$K/src"
+for f in mangosd.conf realmd.conf; do : > "$K/src/$f"; done
+cat > "$K/bin/kubectl" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" apply -f "*) a="$*"; { echo "--- apply"; cat "${a##*-f }"; } >> "$KLOG" ;;
+  *" get job/vanilla-wow-db-init "*) printf '%s' "$STUB_JOB_CONDS" ;;
+  *" logs job/vanilla-wow-db-init "*) echo "db-init: ERROR 1062 at line 7: the stub's last line" ;;
+  *" create configmap "*) echo "kind: ConfigMap" ;;
+esac
+exit 0
+STUB
+printf '#!/bin/sh\nexit 0\n' > "$K/bin/docker"
+chmod +x "$K/bin/kubectl" "$K/bin/docker"
+runk8s() {   # runk8s CONDITIONS -> output; applied manifests in $K/applied
+    : > "$K/applied"
+    KLOG="$K/applied" STUB_JOB_CONDS="$1" PATH="$K/bin:$PATH" \
+    NORDRASSIL_DB_INIT_POLL=0 NORDRASSIL_DB_INIT_TIMEOUT=0 \
+        bash "$ENG" --no-profile --context stub run-k8s </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+    return "${PIPESTATUS[0]}"
+}
+bash "$ENG" --no-profile set SOURCE_DIR "$K/src" >/dev/null 2>&1
+bash "$ENG" --no-profile set DB_PASS s3cret >/dev/null 2>&1
+out="$(runk8s "FailureTarget Failed ")"; rc=$?
+chk "a failed Job: run-k8s exits non-zero"   '[[ $rc -ne 0 ]] && grep -q "the server was NOT deployed" <<<"$out"'
+chk "  the db-init Job itself was applied"   'grep -q "name: vanilla-wow-db-init" "$K/applied"'
+chk "  the server Deployment is NOT applied" '! grep -q "name: vanilla-wow-server" "$K/applied"'
+chk "  and the Job's logs are shown"         'grep -q "the stub.s last line" <<<"$out"'
+out="$(runk8s "Complete ")"; rc=$?
+chk "a completed Job: the server IS applied" '[[ $rc -eq 0 ]] && grep -q "name: vanilla-wow-server" "$K/applied"'
+chk "  and no Job logs are shown"            '! grep -q "the stub.s last line" <<<"$out"'
+out="$(runk8s "")"; rc=$?
+chk "a Job still running at the timeout: deployed anyway" '[[ $rc -eq 0 ]] && grep -q "name: vanilla-wow-server" "$K/applied" && grep -q "did not complete in time" <<<"$out"'
 
 printf '\n  pass=%s fail=%s\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]
