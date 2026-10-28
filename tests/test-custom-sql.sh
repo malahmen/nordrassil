@@ -139,12 +139,16 @@ fi
 
 hdr "run-k8s waits for the Job to complete or to fail (Kamino item 109)"
 # _wait_db_init against a kubectl that answers a scripted sequence of the Job's
-# True conditions, one per poll. Polled with no sleep.
+# True conditions, one per poll. sleep is a no-op and each poll counts as one
+# second, so a wait that misses its condition runs out its TIMEOUT polls and
+# fails the check, rather than looping forever (a poll of 0 never advanced
+# the clock, so a dropped Failed branch hung the suite).
 wait_fn="$(sed -n '/^_wait_db_init() {/,/^}/p' "$SRC")"
 waitrun() {   # waitrun TIMEOUT CONDITIONS... -> rc of _wait_db_init, polls in $T/polls
     local limit="$1"; shift
     printf '%s\n' "$@" > "$T/conds"; : > "$T/polls"
-    K8S_NAMESPACE=vanilla-wow NORDRASSIL_DB_INIT_POLL=0 NORDRASSIL_DB_INIT_TIMEOUT="$limit" bash -c '
+    K8S_NAMESPACE=vanilla-wow NORDRASSIL_DB_INIT_POLL=1 NORDRASSIL_DB_INIT_TIMEOUT="$limit" bash -c '
+        sleep() { :; }
         kubectl() { local n; n=$(wc -l < "$T/polls"); echo x >> "$T/polls"
                     sed -n "$((n + 1))p" "$T/conds"; }
         '"$wait_fn"'
