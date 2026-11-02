@@ -91,7 +91,11 @@ Deploy:
   stop-k8s
 
 Accounts:
-  create-account --name N --pass P [--level L] [--where local|docker|k8s]
+  create-account --name N --pass-stdin [--level L] [--where local|docker|k8s]
+                                  password = first line of stdin. --pass P
+                                  still works but is visible in 'ps' to
+                                  anyone on the host; prefer --pass-stdin.
+                                  Giving both is an error.
   list-accounts [--where ...]
   delete-account --name N [--where ...]
   set-account-level --name N --level L [--where ...]

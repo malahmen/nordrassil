@@ -103,18 +103,39 @@ cmd_create_account() {
     header "nordrassil — Create account"
     _settings
 
-    local user_input="" pass_input="" gm_num=0
+    # --pass-stdin is the way to give the password: --pass puts it in this
+    # process's argv, where anyone on the host can read it with 'ps' for as
+    # long as the command runs (Kamino 233). --pass still works, for callers
+    # written before --pass-stdin existed.
+    local user_input="" pass_input="" gm_num=0 pass_flag="" from_stdin=""
     while [[ $# -gt 0 ]]; do case "$1" in
         --name)  user_input="$2"; shift 2 ;;
-        --pass)  pass_input="$2"; shift 2 ;;
+        --pass)  pass_input="$2"; pass_flag=1; shift 2 ;;
+        --pass-stdin) from_stdin=1; shift ;;
         --level) gm_num="$2"; shift 2 ;;
         --where) WHERE="$2"; shift 2 ;;
         *) error_exit "create-account: unknown flag: $1" ;;
     esac; done
+    [[ -n "$pass_flag" && -n "$from_stdin" ]] \
+        && error_exit "create-account: --pass and --pass-stdin are mutually exclusive; give the password one way (--pass-stdin)."
     [[ -n "$user_input" ]] || error_exit "create-account: --name is required."
-    [[ -n "$pass_input" ]] || error_exit "create-account: --pass is required."
+    local pass_label="--pass"
+    if [[ -n "$from_stdin" ]]; then
+        pass_label="--pass-stdin"
+        # The first line of stdin, and only that line. read returns non-zero
+        # on a last line without a newline, which is still a password. A
+        # terminal gets -s so the password isn't echoed while it is typed.
+        if [[ -t 0 ]]; then
+            printf 'Password: ' >&2
+            IFS= read -rs pass_input; printf '\n' >&2
+        else
+            IFS= read -r pass_input || [[ -n "$pass_input" ]] \
+                || error_exit "create-account: --pass-stdin read nothing from stdin."
+        fi
+    fi
+    [[ -n "$pass_input" ]] || error_exit "create-account: a password is required (--pass-stdin, or --pass)."
     _validate_console_arg "create-account: --name" "$user_input"
-    _validate_console_arg "create-account: --pass" "$pass_input"
+    _validate_console_arg "create-account: ${pass_label}" "$pass_input"
     [[ "$gm_num" =~ ^[0-6]$ ]] || error_exit "create-account: --level must be 0-6 (see the GM-level scale)."
 
     local target
@@ -126,6 +147,11 @@ cmd_create_account() {
     # to the very next console command yet (an in-memory cache/registration
     # lag, not a DB write issue, the account itself is created correctly
     # either way). A few seconds between the two is enough.
+    #
+    # The line, password included, reaches mangosd on stdin on every path —
+    # written to the FIFO by the printf builtin (local), or piped into
+    # 'docker exec -i' / 'kubectl exec -i' / ssh — never as an argument to
+    # any command, so it is not in 'ps' here or on the far side.
     _send_console_cmd "$target" "account create ${user_input} ${pass_input}" || return 1
 
     if [[ "$gm_num" != "0" ]]; then
