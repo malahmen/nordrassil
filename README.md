@@ -115,7 +115,9 @@ Deploy
   stop-k8s
 
 Accounts
-  create-account --name N --pass P [--level 0-6] [--where local|docker|k8s]
+  create-account --name N --pass-stdin [--level 0-6] [--where local|docker|k8s]
+                                          # password = first line of stdin;
+                                          # --pass P still works but is visible in `ps`
   list-accounts [--where ...]
   delete-account --name N [--where ...]
   set-account-level --name N --level 0-6 [--where ...]
@@ -178,9 +180,24 @@ Things worth knowing:
 ./nordrassil.sh --kind homelab run-k8s --namespace wow --address 192.168.1.50
 
 # a GM account and a rename
-./nordrassil.sh create-account --name admin --pass secret --level 3
+printf '%s\n' "$PW" | ./nordrassil.sh create-account --name admin --pass-stdin --level 3
 ./nordrassil.sh rename-character --from Leeroy --to Jenkins
 ```
+
+### Account passwords
+
+`create-account --pass-stdin` reads the password from the first line of stdin
+(from a terminal it prompts without echoing). `--pass P` is still accepted for
+older callers, but it puts the password in this process's argv, where anyone on
+the host can read it with `ps` while the command runs; giving both is an error.
+Either way the password is held to what mangosd's console accepts: 1-16
+printable characters, no whitespace.
+
+From there it never becomes a command-line argument on any `--where` path: the
+`account create` line is written to mangosd's console FIFO by a shell builtin
+(local), or piped on stdin into `docker exec -i` / `kubectl exec -i` — and into
+`ssh` when `SERVER_SSH_HOST` is set — so it is not in `ps` on this host or on
+the server.
 
 ## Administration
 
@@ -387,7 +404,7 @@ it, driven from a machine with neither `kubectl` nor the password on it.
 ./nordrassil.sh --profile meksha set SERVER_FIFO /opt/azeroth/mangosd.stdin
 
 ./nordrassil.sh --profile meksha search --kind npcs --term Hogger
-./nordrassil.sh --profile meksha create-account --name bob --pass hunter2
+./nordrassil.sh --profile meksha create-account --name bob --pass-stdin   # type it, not echoed
 ```
 
 ## Configuration
@@ -441,7 +458,7 @@ NORDRASSIL=/path/to/nordrassil.sh tests/run-all.sh
 tests/test-profiles.sh                # one of them
 ```
 
-**191 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
+**259 checks**, no network and no server. `tests/stubs/` shadows `mariadb`,
 `mariadb-dump`, `docker` and `kubectl` on PATH, and every test works in its own
 `XDG_CONFIG_HOME` under a temporary directory — so a run cannot reach a
 database, a docker socket, a cluster, or the config in `~/.config/nordrassil`.
@@ -449,11 +466,12 @@ One assertion checks that last part directly.
 
 | File | Checks | What it covers |
 | ---- | -----: | -------------- |
+| `test-create-account-stdin.sh` | 62 | `create-account --pass-stdin` on every `--where` path (local FIFO, `docker exec`, `kubectl exec`, both also over ssh), the whole script run against recording fakes: the password arrives on the console's stdin and is in no recorded argv; `--pass` with `--pass-stdin` is refused; `--pass` still works; the console's 1-16 printable gate applies to stdin too |
 | `test-settings-entrypoint-ace.sh` | 41 | numeric settings refused by `set` and, when already stored, by every command that would use them; the entrypoint stops the other server when one dies; the ACE tarball is checked before it is unpacked |
 | `test-provisioning-guard.sh` | 36 | provisioning refuses a profile pointing elsewhere, `--kind`/`--context` still work, administration is unaffected; every provisioning command goes through the one gate |
 | `test-profiles.sh` | 33 | a profile that does not exist is refused; `--no-profile`; 0600 files in 0700 directories; `MANAGED_EXTERNALLY` cannot brick the tool |
 | `test-db-password.sh` | 28 | `DB_PASS=ask` resolves instead of reaching a conf file as the literal string; verify-then-cache, and its three answers; the prompt survives having no terminal |
-| `test-custom-sql.sh` | 26 | the bootstrap, run by the engine and by the Job's `db-init.sh`: only the selected Custom scripts are applied and only successful ones recorded; the Job's password stays off argv; the Job is wired to the ConfigMap (that check needs PyYAML and skips without it); `run-k8s` stops on a failed Job instead of waiting it out and deploying |
+| `test-custom-sql.sh` | 32 | the bootstrap, run by the engine and by the Job's `db-init.sh`: only the selected Custom scripts are applied and only successful ones recorded; the Job's password stays off argv; the Job is wired to the ConfigMap (that check needs PyYAML and skips without it); `run-k8s` stops on a failed Job instead of waiting it out and deploying |
 | `test-dump.sh` | 19 | `--default-character-set`, the 0600 dump file, the stream guard that rejects output something else wrote into, and the target banner |
 | `test-restore-scope.sh` | 8 | `--db` is refused on a dump that names its own databases |
 
